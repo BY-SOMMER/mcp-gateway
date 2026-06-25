@@ -902,6 +902,7 @@ func TestCreateWorkingSetID(t *testing.T) {
 		inputName   string
 		existingIDs []string
 		expectedID  string
+		expectError bool
 	}{
 		{
 			name:       "simple name",
@@ -911,24 +912,18 @@ func TestCreateWorkingSetID(t *testing.T) {
 		{
 			name:       "name with spaces",
 			inputName:  "My Working Set",
-			expectedID: "my-working-set",
+			expectedID: "my_working_set",
 		},
 		{
 			name:       "name with special characters",
 			inputName:  "My@Working#Set!",
-			expectedID: "my-working-set-",
+			expectedID: "my_working_set_",
 		},
 		{
-			name:        "name with collision",
+			name:        "name with collision returns error",
 			inputName:   "test",
 			existingIDs: []string{"test"},
-			expectedID:  "test-2",
-		},
-		{
-			name:        "name with multiple collisions",
-			inputName:   "test",
-			existingIDs: []string{"test", "test-2", "test-3"},
-			expectedID:  "test-4",
+			expectError: true,
 		},
 	}
 
@@ -950,8 +945,12 @@ func TestCreateWorkingSetID(t *testing.T) {
 			}
 
 			id, err := createWorkingSetID(ctx, tt.inputName, dao)
-			require.NoError(t, err)
-			assert.Equal(t, tt.expectedID, id)
+			if tt.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.expectedID, id)
+			}
 		})
 	}
 }
@@ -999,22 +998,23 @@ func TestResolveServerFromString(t *testing.T) {
 			expectedVersion: "latest",
 		},
 		{
-			name:  "http registry",
-			input: "http://example.com/v0/servers/my-server",
-			expected: []Server{{
-				Type:    ServerTypeRegistry,
-				Source:  "http://example.com/v0/servers/my-server/versions/latest",
-				Secrets: "default",
-			}},
-			expectedVersion: "latest",
-		},
-		{
 			name:  "https registry",
 			input: "https://example.com/v0/servers/my-server",
 			expected: []Server{{
 				Type:    ServerTypeRegistry,
 				Source:  "https://example.com/v0/servers/my-server/versions/latest",
 				Secrets: "default",
+				Snapshot: &ServerSnapshot{
+					Server: catalog.Server{
+						Name:        "io-example-my-server",
+						Type:        "server",
+						Image:       "ghcr.io/example/my-server:latest",
+						Description: "Test MCP server",
+						Metadata: &catalog.Metadata{
+							RegistryURL: "https://registry.modelcontextprotocol.io/v0/servers/io.example%2Fmy-server/versions/latest",
+						},
+					},
+				},
 			}},
 			expectedVersion: "latest",
 		},
@@ -1025,6 +1025,17 @@ func TestResolveServerFromString(t *testing.T) {
 				Type:    ServerTypeRegistry,
 				Source:  "https://example.com/v0/servers/my-server/versions/0.1.0",
 				Secrets: "default",
+				Snapshot: &ServerSnapshot{
+					Server: catalog.Server{
+						Name:        "io-example-my-server",
+						Type:        "server",
+						Image:       "ghcr.io/example/my-server:0.1.0",
+						Description: "Test MCP server",
+						Metadata: &catalog.Metadata{
+							RegistryURL: "https://registry.modelcontextprotocol.io/v0/servers/io.example%2Fmy-server/versions/0.1.0",
+						},
+					},
+				},
 			}},
 			expectedVersion: "0.1.0",
 		},
@@ -1041,10 +1052,16 @@ func TestResolveServerFromString(t *testing.T) {
 
 			serverResponse := v0.ServerResponse{
 				Server: v0.ServerJSON{
-					Version: tt.expectedVersion,
+					Name:        "io.example/my-server",
+					Description: "Test MCP server",
+					Version:     tt.expectedVersion,
 					Packages: []model.Package{
 						{
 							RegistryType: "oci",
+							Identifier:   "ghcr.io/example/my-server:" + tt.expectedVersion,
+							Transport: model.Transport{
+								Type: "stdio",
+							},
 						},
 					},
 				},
@@ -1055,14 +1072,11 @@ func TestResolveServerFromString(t *testing.T) {
 				},
 			}
 			registryClient := mocks.NewMockRegistryAPIClient(mocks.WithServerListResponses(map[string]v0.ServerListResponse{
-				"http://example.com/v0/servers/my-server/versions": {
-					Servers: []v0.ServerResponse{serverResponse},
-				},
 				"https://example.com/v0/servers/my-server/versions": {
 					Servers: []v0.ServerResponse{serverResponse},
 				},
 			}), mocks.WithServerResponses(map[string]v0.ServerResponse{
-				"http://example.com/v0/servers/my-server/versions/" + tt.expectedVersion: serverResponse,
+				"https://example.com/v0/servers/my-server/versions/" + tt.expectedVersion: serverResponse,
 			}))
 
 			ociService := mocks.NewMockOCIService(
@@ -1094,6 +1108,14 @@ func TestResolveServerFromString(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveServerFromStringRejectsHTTPRegistryByDefault(t *testing.T) {
+	dao := setupTestDB(t)
+
+	_, err := ResolveServersFromString(t.Context(), mocks.NewMockRegistryAPIClient(), mocks.NewMockOCIService(), dao, "http://example.com/v0/servers/my-server")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote URL must use https")
 }
 
 func TestResolveFile(t *testing.T) {
@@ -1259,23 +1281,17 @@ func TestResolveFile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// write temp file to disk
-			tempDir := t.TempDir()
+			tempHome := t.TempDir()
+			t.Setenv("HOME", tempHome)
+
 			if tt.file != "" {
 				content, err := testData.ReadFile("testdata/" + tt.file)
 				require.NoError(t, err)
-				tempFile := filepath.Join(tempDir, "testdata", tt.file)
+				tempFile := filepath.Join(tempHome, ".docker", "mcp", "catalogs", "testdata", tt.file)
 				_ = os.MkdirAll(filepath.Dir(tempFile), 0o755)
 				err = os.WriteFile(tempFile, content, 0o644)
 				require.NoError(t, err)
-				defer os.Remove(tempFile)
 			}
-
-			cwd, err := os.Getwd()
-			require.NoError(t, err)
-			defer os.Chdir(cwd) //nolint:errcheck
-			err = os.Chdir(tempDir)
-			require.NoError(t, err)
 
 			server, err := ResolveServersFromString(t.Context(), mocks.NewMockRegistryAPIClient(), mocks.NewMockOCIService(), setupTestDB(t), tt.input)
 			if tt.expectedErr != "" {
@@ -1289,15 +1305,89 @@ func TestResolveFile(t *testing.T) {
 	}
 }
 
+func TestResolveFileDecodesEscapedLocalReference(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	content, err := testData.ReadFile("testdata/server.yaml")
+	require.NoError(t, err)
+
+	tempFile := filepath.Join(tempHome, ".docker", "mcp", "catalogs", "testdata", "server copy.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(tempFile), 0o755))
+	require.NoError(t, os.WriteFile(tempFile, content, 0o644))
+
+	servers, err := ResolveServersFromString(t.Context(), mocks.NewMockRegistryAPIClient(), mocks.NewMockOCIService(), setupTestDB(t), "file://testdata/server%20copy.yaml")
+	require.NoError(t, err)
+	require.Len(t, servers, 1)
+	require.Equal(t, "myimage:latest", servers[0].Image)
+}
+
+func TestResolveFileRejectsInvalidEscapedLocalReference(t *testing.T) {
+	_, err := ResolveServersFromString(t.Context(), mocks.NewMockRegistryAPIClient(), mocks.NewMockOCIService(), setupTestDB(t), "file://testdata/%zz.yaml")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "invalid local file reference")
+}
+
+func TestResolveFileRejectsUntrustedPaths(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	outsideDir := t.TempDir()
+	outsideServer := filepath.Join(outsideDir, "server.yaml")
+	content, err := testData.ReadFile("testdata/server.yaml")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(outsideServer, content, 0o644))
+
+	cwd := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, "server.yaml"), content, 0o644))
+	originalCwd, err := os.Getwd()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = os.Chdir(originalCwd)
+	})
+	require.NoError(t, os.Chdir(cwd))
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "absolute path outside catalogs dir",
+			input: "file://" + outsideServer,
+		},
+		{
+			name:  "relative traversal outside catalogs dir",
+			input: "file://../server.yaml",
+		},
+		{
+			name:  "dot-relative path outside catalogs dir",
+			input: "file://./server.yaml",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ResolveServersFromString(t.Context(), mocks.NewMockRegistryAPIClient(), mocks.NewMockOCIService(), setupTestDB(t), tt.input)
+			require.ErrorContains(t, err, "local file path must resolve within Docker MCP catalogs directory")
+		})
+	}
+}
+
 func TestResolveServerFromStringResolvesLatestVersion(t *testing.T) {
 	dao := setupTestDB(t)
 
 	serverResponse := v0.ServerResponse{
 		Server: v0.ServerJSON{
-			Version: "0.2.0",
+			Name:        "io.example/my-server",
+			Description: "Test MCP server",
+			Version:     "0.2.0",
 			Packages: []model.Package{
 				{
 					RegistryType: "oci",
+					Identifier:   "ghcr.io/example/my-server:0.2.0",
+					Transport: model.Transport{
+						Type: "stdio",
+					},
 				},
 			},
 		},
@@ -1309,10 +1399,16 @@ func TestResolveServerFromStringResolvesLatestVersion(t *testing.T) {
 	}
 	oldServerResponse := v0.ServerResponse{
 		Server: v0.ServerJSON{
-			Version: "0.1.0",
+			Name:        "io.example/my-server",
+			Description: "Test MCP server",
+			Version:     "0.1.0",
 			Packages: []model.Package{
 				{
 					RegistryType: "oci",
+					Identifier:   "ghcr.io/example/my-server:0.1.0",
+					Transport: model.Transport{
+						Type: "stdio",
+					},
 				},
 			},
 		},
@@ -1323,17 +1419,17 @@ func TestResolveServerFromStringResolvesLatestVersion(t *testing.T) {
 		},
 	}
 	registryClient := mocks.NewMockRegistryAPIClient(mocks.WithServerListResponses(map[string]v0.ServerListResponse{
-		"http://example.com/v0/servers/my-server/versions": {
+		"https://example.com/v0/servers/my-server/versions": {
 			Servers: []v0.ServerResponse{serverResponse, oldServerResponse},
 		},
 	}), mocks.WithServerResponses(map[string]v0.ServerResponse{
-		"http://example.com/v0/servers/my-server/versions/0.1.0": oldServerResponse,
-		"http://example.com/v0/servers/my-server/versions/0.2.0": serverResponse,
+		"https://example.com/v0/servers/my-server/versions/0.1.0": oldServerResponse,
+		"https://example.com/v0/servers/my-server/versions/0.2.0": serverResponse,
 	}))
 
-	server, err := ResolveServersFromString(t.Context(), registryClient, mocks.NewMockOCIService(), dao, "http://example.com/v0/servers/my-server")
+	server, err := ResolveServersFromString(t.Context(), registryClient, mocks.NewMockOCIService(), dao, "https://example.com/v0/servers/my-server")
 	require.NoError(t, err)
-	assert.Equal(t, "http://example.com/v0/servers/my-server/versions/0.2.0", server[0].Source)
+	assert.Equal(t, "https://example.com/v0/servers/my-server/versions/0.2.0", server[0].Source)
 }
 
 func TestResolveSnapshot(t *testing.T) {
@@ -1526,6 +1622,75 @@ metadata:
 					assert.Equal(t, tt.expected.Server.Metadata.Owner, snapshot.Server.Metadata.Owner)
 				}
 			}
+		})
+	}
+}
+
+func TestIsV0ServerJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		json     string
+		expected bool
+	}{
+		{
+			name: "catalog.Server with type field",
+			json: `{
+				"name": "test-server",
+				"type": "server",
+				"image": "myimage:latest"
+			}`,
+			expected: false,
+		},
+		{
+			name: "v0.ServerJSON with schema field",
+			json: `{
+				"$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+				"name": "test-server",
+				"version": "1.0.0"
+			}`,
+			expected: true,
+		},
+		{
+			name: "v0.ServerJSON with packages",
+			json: `{
+				"name": "test-server",
+				"version": "1.0.0",
+				"packages": [{"type": "docker", "uri": "test"}]
+			}`,
+			expected: true,
+		},
+		{
+			name: "v0.ServerJSON with remotes",
+			json: `{
+				"name": "test-server",
+				"version": "1.0.0",
+				"remotes": [{"url": "http://example.com"}]
+			}`,
+			expected: true,
+		},
+		{
+			name: "catalog.Server should not match even with name",
+			json: `{
+				"name": "test-server",
+				"type": "server",
+				"description": "A test server"
+			}`,
+			expected: false,
+		},
+		{
+			name: "ambiguous case without discriminators",
+			json: `{
+				"name": "test-server",
+				"description": "A test server"
+			}`,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isV0ServerJSON([]byte(tt.json))
+			assert.Equal(t, tt.expected, result, "isV0ServerJSON returned unexpected result")
 		})
 	}
 }

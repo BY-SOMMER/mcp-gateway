@@ -7,18 +7,20 @@ Run the gateway
 
 | Name                        | Type          | Default             | Description                                                                                                                                   |
 |:----------------------------|:--------------|:--------------------|:----------------------------------------------------------------------------------------------------------------------------------------------|
-| `--additional-catalog`      | `stringSlice` |                     | Additional catalog paths to append to the default catalogs                                                                                    |
+| `--additional-catalog`      | `stringSlice` |                     | Additional catalog paths must resolve under ~/.docker/mcp/catalogs/                                                                           |
 | `--additional-config`       | `stringSlice` |                     | Additional config paths to merge with the default config.yaml                                                                                 |
 | `--additional-registry`     | `stringSlice` |                     | Additional registry paths to merge with the default registry.yaml                                                                             |
 | `--additional-tools-config` | `stringSlice` |                     | Additional tools paths to merge with the default tools.yaml                                                                                   |
+| `--allow-unauthenticated`   | `bool`        |                     | Allow unauthenticated HTTP/SSE gateway requests                                                                                               |
 | `--block-network`           | `bool`        |                     | Block tools from accessing forbidden network resources                                                                                        |
 | `--block-secrets`           | `bool`        | `true`              | Block secrets from being/received sent to/from tools                                                                                          |
-| `--catalog`                 | `stringSlice` | `[docker-mcp.yaml]` | Paths to docker catalogs (absolute or relative to ~/.docker/mcp/catalogs/)                                                                    |
+| `--catalog`                 | `stringSlice` | `[docker-mcp.yaml]` | Catalog paths must resolve under ~/.docker/mcp/catalogs/                                                                                      |
 | `--config`                  | `stringSlice` | `[config.yaml]`     | Paths to the config files (absolute or relative to ~/.docker/mcp/)                                                                            |
 | `--cpus`                    | `int`         | `1`                 | CPUs allocated to each MCP Server (default is 1)                                                                                              |
 | `--debug-dns`               | `bool`        |                     | Debug DNS resolution                                                                                                                          |
 | `--dry-run`                 | `bool`        |                     | Start the gateway but do not listen for connections (useful for testing the configuration)                                                    |
 | `--enable-all-servers`      | `bool`        |                     | Enable all servers in the catalog (instead of using individual --servers options)                                                             |
+| `--host`                    | `string`      |                     | Host or IP address to bind TCP transports to                                                                                                  |
 | `--interceptor`             | `stringArray` |                     | List of interceptors to use (format: when:type:path, e.g. 'before:exec:/bin/path')                                                            |
 | `--log-calls`               | `bool`        | `true`              | Log calls to the tools                                                                                                                        |
 | `--long-lived`              | `bool`        |                     | Containers are long-lived and will not be removed until the gateway is stopped, useful for stateful servers                                   |
@@ -34,9 +36,8 @@ Run the gateway
 | `--tools-config`            | `stringSlice` | `[tools.yaml]`      | Paths to the tools files (absolute or relative to ~/.docker/mcp/)                                                                             |
 | `--transport`               | `string`      | `stdio`             | stdio, sse or streaming. Uses MCP_GATEWAY_AUTH_TOKEN environment variable for localhost authentication to prevent dns rebinding attacks.      |
 | `--verbose`                 | `bool`        |                     | Verbose output                                                                                                                                |
-| `--verify-signatures`       | `bool`        |                     | Verify signatures of the server images                                                                                                        |
+| `--verify-signatures`       | `bool`        | `true`              | Verify signatures of Docker MCP server images                                                                                                 |
 | `--watch`                   | `bool`        | `true`              | Watch for changes and reconfigure the gateway                                                                                                 |
 
 
 <!---MARKER_GEN_END-->
-

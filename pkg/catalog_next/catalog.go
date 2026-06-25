@@ -8,6 +8,7 @@ import (
 
 	"github.com/docker/mcp-gateway/pkg/db"
 	"github.com/docker/mcp-gateway/pkg/oci"
+	"github.com/docker/mcp-gateway/pkg/policy"
 	"github.com/docker/mcp-gateway/pkg/validate"
 	"github.com/docker/mcp-gateway/pkg/workingset"
 )
@@ -21,6 +22,8 @@ type Catalog struct {
 	Ref             string `yaml:"ref" json:"ref" validate:"required,min=1"`
 	Source          string `yaml:"source,omitempty" json:"source,omitempty"`
 	CatalogArtifact `yaml:",inline"`
+	// Policy describes the policy decision for this catalog.
+	Policy *policy.Decision `yaml:"policy,omitempty" json:"policy,omitempty"`
 }
 
 type CatalogWithDigest struct {
@@ -32,6 +35,8 @@ type CatalogSummary struct {
 	Ref    string `yaml:"ref" json:"ref"`
 	Digest string `yaml:"digest" json:"digest"`
 	Title  string `yaml:"title" json:"title"`
+	// Policy describes the policy decision for this catalog summary.
+	Policy *policy.Decision `yaml:"policy,omitempty" json:"policy,omitempty"`
 }
 
 // Source prefixes must be of the form "<prefix>:"
@@ -40,11 +45,17 @@ const (
 	SourcePrefixLegacyCatalog = "legacy-catalog:"
 	SourcePrefixOCI           = "oci:"
 	SourcePrefixUser          = "user:"
+	SourcePrefixRegistry      = "registry:"
 )
+
+// CommunityRegistryCatalogRef is the OCI reference for the community MCP server catalog.
+const CommunityRegistryCatalogRef = "mcp/community-registry:latest"
 
 type Server struct {
 	Type  workingset.ServerType `yaml:"type" json:"type" validate:"required,oneof=registry image remote"`
 	Tools []string              `yaml:"tools,omitempty" json:"tools,omitempty"`
+	// Policy describes the policy decision for this server.
+	Policy *policy.Decision `yaml:"policy,omitempty" json:"policy,omitempty"`
 
 	// ServerTypeRegistry only
 	Source string `yaml:"source,omitempty" json:"source,omitempty" validate:"required_if=Type registry"`

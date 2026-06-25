@@ -16,8 +16,9 @@ import (
 
 func catalogNextCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "catalog-next",
-		Short: "Manage catalogs (next generation)",
+		Use:     "catalog",
+		Aliases: []string{"catalogs", "catalog-next"},
+		Short:   "Manage MCP server OCI catalogs",
 	}
 
 	cmd.AddCommand(createCatalogNextCommand())
@@ -34,19 +35,70 @@ func catalogNextCommand() *cobra.Command {
 
 func createCatalogNextCommand() *cobra.Command {
 	var opts struct {
-		Title             string
-		FromWorkingSet    string
-		FromLegacyCatalog string
-		Servers           []string
+		Title                 string
+		FromWorkingSet        string
+		FromLegacyCatalog     string
+		FromCommunityRegistry string
+		Servers               []string
+		Exclude               []string
+		IncludePyPI           bool
+		IncludeNPM            bool
 	}
 
 	cmd := &cobra.Command{
-		Use:   "create <oci-reference> [--server <ref1> --server <ref2> ...] [--from-profile <profile-id>] [--from-legacy-catalog <url>] [--title <title>]",
-		Short: "Create a new catalog from a profile or legacy catalog",
-		Args:  cobra.ExactArgs(1),
+		Use:   "create <oci-reference> [--server <ref1> --server <ref2> ...] [--from-profile <profile-id>] [--from-legacy-catalog <url>] [--from-community-registry <hostname>] [--title <title>]",
+		Short: "Create a new catalog from server references, a profile, legacy catalog, or community registry",
+		Long: `Create a new catalog. You can build a catalog directly from server references,
+from an existing profile, from a legacy catalog URL, or from a community registry.
+
+When using --server without --from-profile, --from-legacy-catalog, or --from-community-registry, the --title flag is required.`,
+		Example: `  # Build a catalog directly from server references
+  docker mcp catalog create myorg/catalog:latest --title "My Team Catalog" \
+    --server docker://mcp/custom-tool:latest \
+    --server catalog://my-org/team-catalog:v1/custom-tool
+
+  # Build a catalog with a specific version tag
+  docker mcp catalog create myorg/catalog:v1 --title "v1 Release" \
+    --server catalog://vonwig/private-catalog:v1/bigquery-mcp
+
+  # Copy all servers from one catalog into a new one
+  docker mcp catalog create myorg/new-catalog:latest --title "Combined" \
+    --server catalog://my-org/team-catalog:latest
+
+  # Create from a profile
+  docker mcp catalog create my-catalog --from-profile my-profile --title "My Catalog"
+
+  # Create from a legacy catalog
+  docker mcp catalog create docker-mcp-catalog --from-legacy-catalog https://desktop.docker.com/mcp/catalog/v3/catalog.json
+
+  # Create from a community registry
+  docker mcp catalog create my-catalog --from-community-registry registry.modelcontextprotocol.io --title "Community Servers"`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if opts.FromWorkingSet != "" && opts.FromLegacyCatalog != "" {
-				return fmt.Errorf("cannot use both --from-profile and --from-legacy-catalog")
+			sourceCount := 0
+			if opts.FromWorkingSet != "" {
+				sourceCount++
+			}
+			if opts.FromLegacyCatalog != "" {
+				sourceCount++
+			}
+			if opts.FromCommunityRegistry != "" {
+				sourceCount++
+			}
+			if sourceCount > 1 {
+				return fmt.Errorf("only one of --from-profile, --from-legacy-catalog, or --from-community-registry can be specified")
+			}
+
+			if opts.IncludePyPI && opts.FromCommunityRegistry == "" {
+				return fmt.Errorf("--include-pypi can only be used when creating a catalog from a community registry")
+			}
+
+			if opts.IncludeNPM && opts.FromCommunityRegistry == "" {
+				return fmt.Errorf("--include-npm can only be used when creating a catalog from a community registry")
+			}
+
+			if len(opts.Exclude) > 0 && opts.FromCommunityRegistry == "" {
+				return fmt.Errorf("--exclude can only be used when creating a catalog from a community registry")
 			}
 
 			dao, err := db.New()
@@ -55,24 +107,50 @@ func createCatalogNextCommand() *cobra.Command {
 			}
 			registryClient := registryapi.NewClient()
 			ociService := oci.NewService()
-			return catalognext.Create(cmd.Context(), dao, registryClient, ociService, args[0], opts.Servers, opts.FromWorkingSet, opts.FromLegacyCatalog, opts.Title)
+			return catalognext.Create(cmd.Context(), dao, registryClient, ociService, args[0], catalognext.CreateOptions{
+				Servers:              opts.Servers,
+				WorkingSetID:         opts.FromWorkingSet,
+				LegacyCatalogURL:     opts.FromLegacyCatalog,
+				CommunityRegistryRef: opts.FromCommunityRegistry,
+				Title:                opts.Title,
+				IncludePyPI:          opts.IncludePyPI,
+				IncludeNPM:           opts.IncludeNPM,
+				ExcludeServers:       opts.Exclude,
+			})
 		},
 	}
 
 	flags := cmd.Flags()
-	flags.StringArrayVar(&opts.Servers, "server", []string{}, "Server to include specified with a URI: https:// (MCP Registry reference) or docker:// (Docker Image reference) or catalog:// (Catalog reference). Can be specified multiple times.")
+	flags.StringArrayVar(&opts.Servers, "server", []string{}, "Server to include specified with a URI: https:// (MCP Registry reference) or docker:// (Docker Image reference) or catalog:// (Catalog reference) or file:// (Local file path that resolves under ~/.docker/mcp/catalogs). Can be specified multiple times.")
 	flags.StringVar(&opts.FromWorkingSet, "from-profile", "", "Profile ID to create the catalog from")
 	flags.StringVar(&opts.FromLegacyCatalog, "from-legacy-catalog", "", "Legacy catalog URL to create the catalog from")
+	flags.StringVar(&opts.FromCommunityRegistry, "from-community-registry", "", "Community registry hostname to fetch servers from (e.g. registry.modelcontextprotocol.io)")
 	flags.StringVar(&opts.Title, "title", "", "Title of the catalog")
+
+	flags.StringArrayVar(&opts.Exclude, "exclude", []string{}, "Server name to exclude from the catalog (can be specified multiple times, only valid with --from-community-registry)")
+	flags.BoolVar(&opts.IncludePyPI, "include-pypi", false, "Include PyPI servers when creating a catalog from a community registry")
+	cmd.Flags().MarkHidden("include-pypi") //nolint:errcheck
+	flags.BoolVar(&opts.IncludeNPM, "include-npm", false, "Include npm servers when creating a catalog from a community registry")
+	cmd.Flags().MarkHidden("include-npm") //nolint:errcheck
 
 	return cmd
 }
 
 func tagCatalogNextCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "tag <oci-reference> <tag>",
-		Short: "Tag a catalog",
-		Args:  cobra.ExactArgs(2),
+		Use:   "tag SOURCE_IMAGE[:TAG] TARGET_IMAGE[:TAG]",
+		Short: "Create a tagged copy of a catalog",
+		Long: `Create a new catalog by tagging an existing catalog with a new name or version.
+This creates a copy of the source catalog with a new reference, similar to Docker image tagging.`,
+		Args: cobra.ExactArgs(2),
+		Example: `  # Tag a catalog with a new version
+  docker mcp catalog tag mcp/my-catalog:v1 mcp/my-catalog:v2
+
+  # Create a tagged copy with a different name
+  docker mcp catalog tag mcp/team-catalog:latest mcp/prod-catalog:v1.0
+
+  # Tag without explicit version (uses latest)
+  docker mcp catalog tag mcp/my-catalog mcp/my-catalog:backup`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dao, err := db.New()
 			if err != nil {
@@ -155,7 +233,12 @@ func removeCatalogNextCommand() *cobra.Command {
 		Use:     "remove <oci-reference>",
 		Aliases: []string{"rm"},
 		Short:   "Remove a catalog",
-		Args:    cobra.ExactArgs(1),
+		Example: `  # Remove the community registry catalog
+  docker mcp catalog remove ` + catalognext.CommunityRegistryCatalogRef + `
+
+  # Remove a custom catalog
+  docker mcp catalog remove myorg/my-catalog:latest`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dao, err := db.New()
 			if err != nil {
@@ -184,8 +267,19 @@ func pushCatalogNextCommand() *cobra.Command {
 func pullCatalogNextCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "pull <oci-reference>",
-		Short: "Pull a catalog from an OCI registry",
-		Args:  cobra.ExactArgs(1),
+		Short: "Pull and import an MCP server catalog from an OCI registry",
+		Long: `Pull and import an MCP server catalog from an OCI registry.
+
+Available Catalogs:
+  Community Registry:  ` + catalognext.CommunityRegistryCatalogRef + `
+
+  ⚠️ Community Registry servers are not vetted by Docker`,
+		Example: `  # Pull the community MCP server catalog
+  docker mcp catalog pull ` + catalognext.CommunityRegistryCatalogRef + `
+
+  # Pull a custom catalog
+  docker mcp catalog pull myorg/my-catalog:latest`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dao, err := db.New()
 			if err != nil {
@@ -205,6 +299,8 @@ func catalogNextServerCommand() *cobra.Command {
 
 	cmd.AddCommand(listCatalogNextServersCommand())
 	cmd.AddCommand(inspectServerCatalogNextCommand())
+	cmd.AddCommand(addCatalogNextServersCommand())
+	cmd.AddCommand(removeCatalogNextServersCommand())
 
 	return cmd
 }
@@ -252,16 +348,16 @@ func listCatalogNextServersCommand() *cobra.Command {
 Use --filter to search for servers matching a query (case-insensitive substring matching on server names).
 Filters use key=value format (e.g., name=github).`,
 		Example: `  # List all servers in a catalog
-  docker mcp catalog-next server ls mcp/docker-mcp-catalog:latest
+  docker mcp catalog server ls mcp/docker-mcp-catalog:latest
 
   # Filter servers by name
-  docker mcp catalog-next server ls mcp/docker-mcp-catalog:latest --filter name=github
+  docker mcp catalog server ls mcp/docker-mcp-catalog:latest --filter name=github
 
   # Combine multiple filters (using short flag)
-  docker mcp catalog-next server ls mcp/docker-mcp-catalog:latest -f name=slack -f name=github
+  docker mcp catalog server ls mcp/docker-mcp-catalog:latest -f name=slack -f name=github
 
   # Output in JSON format
-  docker mcp catalog-next server ls mcp/docker-mcp-catalog:latest --format json`,
+  docker mcp catalog server ls mcp/docker-mcp-catalog:latest --format json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			supported := slices.Contains(workingset.SupportedFormats(), opts.Format)
@@ -281,6 +377,80 @@ Filters use key=value format (e.g., name=github).`,
 	flags := cmd.Flags()
 	flags.StringArrayVarP(&opts.Filters, "filter", "f", []string{}, "Filter output (e.g., name=github)")
 	flags.StringVar(&opts.Format, "format", string(workingset.OutputFormatHumanReadable), fmt.Sprintf("Supported: %s.", strings.Join(workingset.SupportedFormats(), ", ")))
+
+	return cmd
+}
+
+func addCatalogNextServersCommand() *cobra.Command {
+	var servers []string
+
+	cmd := &cobra.Command{
+		Use:   "add <oci-reference> [--server <ref1> --server <ref2> ...]",
+		Short: "Add MCP servers to a catalog",
+		Long:  "Add MCP servers to a catalog using various URI schemes.",
+		Example: `  # Add servers from another catalog
+  docker mcp catalog server add mcp/my-catalog:latest --server catalog://mcp/docker-mcp-catalog:latest/github
+
+  # Add a server from a specific catalog version
+  docker mcp catalog server add mcp/my-catalog:latest --server catalog://vonwig/private-catalog:v1/bigquery-mcp
+
+  # Add servers with OCI references
+  docker mcp catalog server add mcp/my-catalog:latest --server docker://my-server:latest
+
+  # Add servers with MCP Registry references
+  docker mcp catalog server add mcp/my-catalog:latest --server https://registry.modelcontextprotocol.io/v0/servers/71de5a2a-6cfb-4250-a196-f93080ecc860
+
+  # Mix server references
+  docker mcp catalog server add mcp/my-catalog:latest --server catalog://mcp/docker-mcp-catalog:latest/github --server docker://my-server:latest`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dao, err := db.New()
+			if err != nil {
+				return err
+			}
+			registryClient := registryapi.NewClient()
+			ociService := oci.NewService()
+			return catalognext.AddServers(cmd.Context(), dao, registryClient, ociService, args[0], servers)
+		},
+	}
+
+	flags := cmd.Flags()
+	flags.StringArrayVar(&servers, "server", []string{}, "Server to include specified with a URI: https:// (MCP Registry reference) or docker:// (Docker Image reference) or catalog:// (Catalog reference) or file:// (Local file path that resolves under ~/.docker/mcp/catalogs). Can be specified multiple times.")
+
+	return cmd
+}
+
+func removeCatalogNextServersCommand() *cobra.Command {
+	var names []string
+
+	cmd := &cobra.Command{
+		Use:     "remove <oci-reference> [<name1> <name2> ...] [--name <name>]",
+		Aliases: []string{"rm"},
+		Short:   "Remove MCP servers from a catalog",
+		Long:    "Remove MCP servers from a catalog by server name. Server names can be passed as positional arguments or with the --name flag.",
+		Example: `  # Remove servers by name (positional)
+  docker mcp catalog server remove mcp/my-catalog:latest github slack
+
+  # Remove a single server
+  docker mcp catalog server remove mcp/my-catalog:latest github
+
+  # Remove servers using --name flag
+  docker mcp catalog server remove mcp/my-catalog:latest --name github --name slack`,
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			allNames := make([]string, 0, len(args)-1+len(names))
+			allNames = append(allNames, args[1:]...)
+			allNames = append(allNames, names...)
+			dao, err := db.New()
+			if err != nil {
+				return err
+			}
+			return catalognext.RemoveServers(cmd.Context(), dao, args[0], allNames)
+		},
+	}
+
+	flags := cmd.Flags()
+	flags.StringArrayVar(&names, "name", []string{}, "Server name to remove (can be specified multiple times)")
 
 	return cmd
 }

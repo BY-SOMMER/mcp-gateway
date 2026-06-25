@@ -1,17 +1,33 @@
 package catalognext
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	v0 "github.com/modelcontextprotocol/registry/pkg/api/v0"
+	"github.com/modelcontextprotocol/registry/pkg/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/docker/mcp-gateway/pkg/catalog"
 	"github.com/docker/mcp-gateway/pkg/db"
 	"github.com/docker/mcp-gateway/pkg/workingset"
+	"github.com/docker/mcp-gateway/test/mocks"
 )
+
+func trustedLegacyCatalogPath(t *testing.T) string {
+	t.Helper()
+
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	catalogFile := filepath.Join(tempHome, ".docker", "mcp", "catalogs", "test-catalog.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(catalogFile), 0o755))
+
+	return catalogFile
+}
 
 func TestCreateFromWorkingSet(t *testing.T) {
 	dao := setupTestDB(t)
@@ -41,7 +57,10 @@ func TestCreateFromWorkingSet(t *testing.T) {
 
 	// Capture stdout to verify the output message
 	output := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog:latest", []string{}, "test-ws", "", "My Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog:latest", CreateOptions{
+			WorkingSetID: "test-ws",
+			Title:        "My Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -84,7 +103,10 @@ func TestCreateFromWorkingSetNormalizedRef(t *testing.T) {
 
 	// Capture stdout to verify the output message
 	output := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "docker.io/test/catalog:latest", []string{}, "test-ws", "", "My Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "docker.io/test/catalog:latest", CreateOptions{
+			WorkingSetID: "test-ws",
+			Title:        "My Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -115,7 +137,10 @@ func TestCreateFromWorkingSetRejectsDigestReference(t *testing.T) {
 	require.NoError(t, err)
 
 	digestRef := "test/catalog@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-	err = Create(ctx, dao, getMockRegistryClient(), getMockOciService(), digestRef, []string{}, "test-ws", "", "My Catalog")
+	err = Create(ctx, dao, getMockRegistryClient(), getMockOciService(), digestRef, CreateOptions{
+		WorkingSetID: "test-ws",
+		Title:        "My Catalog",
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "reference must be a valid OCI reference without a digest")
 }
@@ -142,7 +167,9 @@ func TestCreateFromWorkingSetWithEmptyName(t *testing.T) {
 
 	// Create catalog without providing a title (should use working set name)
 	captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog2:latest", []string{}, "test-ws", "", "")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog2:latest", CreateOptions{
+			WorkingSetID: "test-ws",
+		})
 		require.NoError(t, err)
 	})
 
@@ -159,7 +186,10 @@ func TestCreateFromWorkingSetNotFound(t *testing.T) {
 	dao := setupTestDB(t)
 	ctx := t.Context()
 
-	err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog3:latest", []string{}, "nonexistent-ws", "", "Test")
+	err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog3:latest", CreateOptions{
+		WorkingSetID: "nonexistent-ws",
+		Title:        "Test",
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "profile nonexistent-ws not found")
 }
@@ -186,12 +216,18 @@ func TestCreateFromWorkingSetDuplicate(t *testing.T) {
 
 	// Create catalog from working set
 	captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog4:latest", []string{}, "test-ws", "", "Test")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog4:latest", CreateOptions{
+			WorkingSetID: "test-ws",
+			Title:        "Test",
+		})
 		require.NoError(t, err)
 	})
 
 	// Create with same ref again - should succeed and replace (upsert behavior)
-	err = Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog4:latest", []string{}, "test-ws", "", "Test Updated")
+	err = Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog4:latest", CreateOptions{
+		WorkingSetID: "test-ws",
+		Title:        "Test Updated",
+	})
 	require.NoError(t, err)
 
 	// Verify it was updated
@@ -234,7 +270,10 @@ func TestCreateFromWorkingSetWithSnapshot(t *testing.T) {
 
 	// Create catalog from working set
 	captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog5:latest", []string{}, "test-ws", "", "Test")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog5:latest", CreateOptions{
+			WorkingSetID: "test-ws",
+			Title:        "Test",
+		})
 		require.NoError(t, err)
 	})
 
@@ -266,7 +305,10 @@ func TestCreateFromWorkingSetEmptyServers(t *testing.T) {
 
 	// Create catalog from empty working set
 	captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog7:latest", []string{}, "empty-ws", "", "Empty Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog7:latest", CreateOptions{
+			WorkingSetID: "empty-ws",
+			Title:        "Empty Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -316,7 +358,10 @@ func TestCreateFromWorkingSetPreservesAllServerFields(t *testing.T) {
 
 	// Create catalog
 	captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog8:latest", []string{}, "detailed-ws", "", "Detailed Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/catalog8:latest", CreateOptions{
+			WorkingSetID: "detailed-ws",
+			Title:        "Detailed Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -348,9 +393,7 @@ func TestCreateFromLegacyCatalog(t *testing.T) {
 	dao := setupTestDB(t)
 	ctx := t.Context()
 
-	// Create a temporary legacy catalog file
-	tempDir := t.TempDir()
-	catalogFile := filepath.Join(tempDir, "test-catalog.yaml")
+	catalogFile := trustedLegacyCatalogPath(t)
 
 	legacyCatalogYAML := `name: test-catalog
 registry:
@@ -359,6 +402,7 @@ registry:
     type: "server"
     image: "docker/test-server:latest"
     description: "A test server"
+    readme: "http://desktop.docker.com/mcp/catalog/v3/readme/test-server.md"
   server2:
     title: "Test Server 2"
     type: "server"
@@ -371,7 +415,10 @@ registry:
 
 	// Create catalog from legacy catalog
 	output := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/imported:latest", []string{}, "", catalogFile, "Imported Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/imported:latest", CreateOptions{
+			LegacyCatalogURL: catalogFile,
+			Title:            "Imported Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -393,6 +440,7 @@ registry:
 	assert.Equal(t, workingset.ServerTypeImage, catalog.Servers[0].Type)
 	assert.Equal(t, "docker/test-server:latest", catalog.Servers[0].Image)
 	assert.Equal(t, "A test server", catalog.Servers[0].Snapshot.Server.Description)
+	assert.Equal(t, "https://desktop.docker.com/mcp/catalog/v3/readme/test-server.md", catalog.Servers[0].Snapshot.Server.ReadmeURL)
 
 	assert.Equal(t, "server2", catalog.Servers[1].Snapshot.Server.Name)
 	assert.Equal(t, "Test Server 2", catalog.Servers[1].Snapshot.Server.Title)
@@ -405,9 +453,7 @@ func TestCreateFromLegacyCatalogWithRemoveExistingWithSameContent(t *testing.T) 
 	dao := setupTestDB(t)
 	ctx := t.Context()
 
-	// Create a temporary legacy catalog file
-	tempDir := t.TempDir()
-	catalogFile := filepath.Join(tempDir, "test-catalog.yaml")
+	catalogFile := trustedLegacyCatalogPath(t)
 
 	legacyCatalogYAML := `name: test-catalog
 registry:
@@ -422,7 +468,10 @@ registry:
 
 	// Create catalog from legacy catalog (first time)
 	output1 := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/legacy3:latest", []string{}, "", catalogFile, "Test Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/legacy3:latest", CreateOptions{
+			LegacyCatalogURL: catalogFile,
+			Title:            "Test Catalog",
+		})
 		require.NoError(t, err)
 	})
 	assert.Contains(t, output1, "test/legacy3:latest created")
@@ -435,7 +484,10 @@ registry:
 
 	// Create with same ref again (upsert) - should replace
 	output2 := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/legacy3:latest", []string{}, "", catalogFile, "Test Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/legacy3:latest", CreateOptions{
+			LegacyCatalogURL: catalogFile,
+			Title:            "Test Catalog",
+		})
 		require.NoError(t, err)
 	})
 	assert.Contains(t, output2, "test/legacy3:latest created")
@@ -456,9 +508,7 @@ func TestCreateFromLegacyCatalogWithRemoveExistingWithDifferentContent(t *testin
 	dao := setupTestDB(t)
 	ctx := t.Context()
 
-	// Create a temporary legacy catalog file
-	tempDir := t.TempDir()
-	catalogFile := filepath.Join(tempDir, "test-catalog.yaml")
+	catalogFile := trustedLegacyCatalogPath(t)
 
 	legacyCatalogYAML := `name: test-catalog
 registry:
@@ -473,7 +523,10 @@ registry:
 
 	// Create catalog from legacy catalog (first time)
 	output1 := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/legacy4:latest", []string{}, "", catalogFile, "Test Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/legacy4:latest", CreateOptions{
+			LegacyCatalogURL: catalogFile,
+			Title:            "Test Catalog",
+		})
 		require.NoError(t, err)
 	})
 	assert.Contains(t, output1, "test/legacy4:latest created")
@@ -497,7 +550,10 @@ registry:
 
 	// Create with same ref again (upsert) - should replace with new content
 	output2 := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/legacy4:latest", []string{}, "", catalogFile, "Test Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/legacy4:latest", CreateOptions{
+			LegacyCatalogURL: catalogFile,
+			Title:            "Test Catalog",
+		})
 		require.NoError(t, err)
 	})
 	assert.Contains(t, output2, "test/legacy4:latest created")
@@ -519,10 +575,13 @@ func TestCreateFromServersWithDockerImages(t *testing.T) {
 	ctx := t.Context()
 
 	output := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/docker-images:latest", []string{
-			"docker://myimage:latest",
-			"docker://anotherimage:v1.0",
-		}, "", "", "Docker Images Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/docker-images:latest", CreateOptions{
+			Servers: []string{
+				"docker://myimage:latest",
+				"docker://anotherimage:v1.0",
+			},
+			Title: "Docker Images Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -549,15 +608,21 @@ func TestCreateFromCatalogEntries(t *testing.T) {
 	ctx := t.Context()
 
 	// Create a catalog to pull from
-	err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "source-catalog", []string{
-		"docker://myimage:latest",
-	}, "", "", "Source Catalog")
+	err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "source-catalog", CreateOptions{
+		Servers: []string{
+			"docker://myimage:latest",
+		},
+		Title: "Source Catalog",
+	})
 	require.NoError(t, err)
 
 	output := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "target-catalog", []string{
-			"catalog://source-catalog/My Image",
-		}, "", "", "Target Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "target-catalog", CreateOptions{
+			Servers: []string{
+				"catalog://source-catalog/My Image",
+			},
+			Title: "Target Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -580,10 +645,13 @@ func TestCreateFromServersWithRegistryServers(t *testing.T) {
 	ctx := t.Context()
 
 	output := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/registry-servers:latest", []string{
-			"https://example.com/v0/servers/server1",
-			"https://example.com/v0/servers/server2",
-		}, "", "", "Registry Servers Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/registry-servers:latest", CreateOptions{
+			Servers: []string{
+				"https://example.com/v0/servers/server1",
+				"https://example.com/v0/servers/server2",
+			},
+			Title: "Registry Servers Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -609,10 +677,13 @@ func TestCreateFromServersWithMixedServers(t *testing.T) {
 	ctx := t.Context()
 
 	output := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/mixed-servers:latest", []string{
-			"docker://myimage:latest",
-			"https://example.com/v0/servers/server1",
-		}, "", "", "Mixed Servers Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/mixed-servers:latest", CreateOptions{
+			Servers: []string{
+				"docker://myimage:latest",
+				"https://example.com/v0/servers/server1",
+			},
+			Title: "Mixed Servers Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -634,9 +705,12 @@ func TestCreateFromServersWithInvalidFormat(t *testing.T) {
 	dao := setupTestDB(t)
 	ctx := t.Context()
 
-	err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/invalid:latest", []string{
-		"invalid-format",
-	}, "", "", "Invalid Catalog")
+	err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/invalid:latest", CreateOptions{
+		Servers: []string{
+			"invalid-format",
+		},
+		Title: "Invalid Catalog",
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid server value")
 }
@@ -646,7 +720,9 @@ func TestCreateFromServersWithEmptyServers(t *testing.T) {
 	ctx := t.Context()
 
 	output := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/empty-servers:latest", []string{}, "", "", "Empty Servers Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/empty-servers:latest", CreateOptions{
+			Title: "Empty Servers Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -665,9 +741,11 @@ func TestCreateFromServersRequiresTitle(t *testing.T) {
 	dao := setupTestDB(t)
 	ctx := t.Context()
 
-	err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/no-title:latest", []string{
-		"docker://myimage:latest",
-	}, "", "", "")
+	err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/no-title:latest", CreateOptions{
+		Servers: []string{
+			"docker://myimage:latest",
+		},
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "title is required")
 }
@@ -694,9 +772,13 @@ func TestCreateFromServersAddsToExistingWorkingSet(t *testing.T) {
 
 	// Create catalog from working set AND add additional servers
 	output := captureStdout(t, func() {
-		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/combined:latest", []string{
-			"docker://myimage:latest",
-		}, "test-ws", "", "Combined Catalog")
+		err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/combined:latest", CreateOptions{
+			Servers: []string{
+				"docker://myimage:latest",
+			},
+			WorkingSetID: "test-ws",
+			Title:        "Combined Catalog",
+		})
 		require.NoError(t, err)
 	})
 
@@ -888,9 +970,7 @@ func TestCreateFromLegacyCatalogWithRemotes(t *testing.T) {
 			dao := setupTestDB(t)
 			ctx := t.Context()
 
-			// Create a temporary legacy catalog file
-			tempDir := t.TempDir()
-			catalogFile := filepath.Join(tempDir, "test-catalog.yaml")
+			catalogFile := trustedLegacyCatalogPath(t)
 
 			legacyCatalogYAML := "name: test-catalog\nregistry:\n  test-server:\n" + tt.serverYAML + "\n"
 
@@ -899,7 +979,10 @@ func TestCreateFromLegacyCatalogWithRemotes(t *testing.T) {
 
 			// Create catalog from legacy catalog
 			output := captureStdout(t, func() {
-				err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/imported:latest", []string{}, "", catalogFile, "Imported Catalog")
+				err := Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "test/imported:latest", CreateOptions{
+					LegacyCatalogURL: catalogFile,
+					Title:            "Imported Catalog",
+				})
 				require.NoError(t, err)
 			})
 
@@ -927,5 +1010,328 @@ func TestCreateFromLegacyCatalogWithRemotes(t *testing.T) {
 			// Run custom validation
 			tt.validateServer(t, &server.Snapshot.Server)
 		})
+	}
+}
+
+func TestCreateFromCommunityRegistry(t *testing.T) {
+	dao := setupTestDB(t)
+	ctx := t.Context()
+
+	// Create a mock client that returns community servers
+	ociServer := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/oci-server",
+			Description: "An OCI server",
+			Version:     "1.0.0",
+			Packages: []model.Package{
+				{
+					RegistryType: "oci",
+					Identifier:   "ghcr.io/example/server:1.0.0",
+					Transport:    model.Transport{Type: "stdio"},
+				},
+			},
+		},
+	}
+	remoteServer := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/remote-server",
+			Description: "A remote server",
+			Version:     "2.0.0",
+			Remotes: []model.Transport{
+				{
+					Type: "sse",
+					URL:  "https://example.com/mcp",
+				},
+			},
+		},
+	}
+	npmServer := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/npm-server",
+			Description: "An npm server (excluded because includeNPM=false)",
+			Version:     "1.0.0",
+			Packages: []model.Package{
+				{
+					RegistryType: "npm",
+					Identifier:   "@example/server",
+				},
+			},
+		},
+	}
+
+	mockClient := mocks.NewMockRegistryAPIClient(
+		mocks.WithListServersResponse([]v0.ServerResponse{ociServer, remoteServer, npmServer}),
+	)
+
+	output := captureStdout(t, func() {
+		err := Create(ctx, dao, mockClient, getMockOciService(), "test/community:latest", CreateOptions{
+			CommunityRegistryRef: "registry.modelcontextprotocol.io",
+			Title:                "MCP Community Registry",
+		})
+		require.NoError(t, err)
+	})
+	assert.Contains(t, output, "Catalog test/community:latest created")
+
+	// Verify the catalog was created
+	catalogs, err := dao.ListCatalogs(ctx)
+	require.NoError(t, err)
+	require.Len(t, catalogs, 1)
+
+	cat := NewFromDb(&catalogs[0])
+	assert.Equal(t, "MCP Community Registry", cat.Title)
+	assert.Equal(t, "registry:registry.modelcontextprotocol.io", cat.Source)
+	// Should have 2 servers (OCI + remote), npm server excluded because includeNPM=false
+	require.Len(t, cat.Servers, 2)
+
+	// Servers should be sorted by name
+	assert.Equal(t, workingset.ServerTypeImage, cat.Servers[0].Type)
+	assert.Equal(t, "ghcr.io/example/server:1.0.0", cat.Servers[0].Image)
+	assert.NotNil(t, cat.Servers[0].Snapshot)
+	assert.Contains(t, cat.Servers[0].Snapshot.Server.Metadata.Tags, "community")
+
+	assert.Equal(t, workingset.ServerTypeRemote, cat.Servers[1].Type)
+	assert.Equal(t, "https://example.com/mcp", cat.Servers[1].Endpoint)
+	assert.NotNil(t, cat.Servers[1].Snapshot)
+	assert.Contains(t, cat.Servers[1].Snapshot.Server.Metadata.Tags, "community")
+}
+
+func TestCreateFromCommunityRegistryWithExclusions(t *testing.T) {
+	dao := setupTestDB(t)
+	ctx := t.Context()
+
+	ociServer := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/oci-server",
+			Description: "An OCI server",
+			Version:     "1.0.0",
+			Packages: []model.Package{
+				{
+					RegistryType: "oci",
+					Identifier:   "ghcr.io/example/server:1.0.0",
+					Transport:    model.Transport{Type: "stdio"},
+				},
+			},
+		},
+	}
+	blockedServer := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/blocked-server",
+			Description: "A server that should be excluded",
+			Version:     "1.0.0",
+			Packages: []model.Package{
+				{
+					RegistryType: "oci",
+					Identifier:   "ghcr.io/example/blocked:1.0.0",
+					Transport:    model.Transport{Type: "stdio"},
+				},
+			},
+		},
+	}
+	remoteServer := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/remote-server",
+			Description: "A remote server",
+			Version:     "2.0.0",
+			Remotes: []model.Transport{
+				{
+					Type: "sse",
+					URL:  "https://example.com/mcp",
+				},
+			},
+		},
+	}
+
+	mockClient := mocks.NewMockRegistryAPIClient(
+		mocks.WithListServersResponse([]v0.ServerResponse{ociServer, blockedServer, remoteServer}),
+	)
+
+	output := captureStdout(t, func() {
+		err := Create(ctx, dao, mockClient, getMockOciService(), "test/community-excluded:latest", CreateOptions{
+			CommunityRegistryRef: "registry.modelcontextprotocol.io",
+			Title:                "MCP Community Registry",
+			ExcludeServers:       []string{"io.example/blocked-server"},
+		})
+		require.NoError(t, err)
+	})
+	assert.Contains(t, output, "Catalog test/community-excluded:latest created")
+
+	catalogs, err := dao.ListCatalogs(ctx)
+	require.NoError(t, err)
+	require.Len(t, catalogs, 1)
+
+	cat := NewFromDb(&catalogs[0])
+	// Should have 2 servers (OCI + remote), blocked server should be excluded
+	require.Len(t, cat.Servers, 2)
+
+	// Verify the blocked server is not present
+	for _, s := range cat.Servers {
+		assert.NotEqual(t, "ghcr.io/example/blocked:1.0.0", s.Image, "blocked server should not appear in catalog")
+	}
+
+	// Verify the non-blocked servers are present
+	assert.Equal(t, workingset.ServerTypeImage, cat.Servers[0].Type)
+	assert.Equal(t, "ghcr.io/example/server:1.0.0", cat.Servers[0].Image)
+
+	assert.Equal(t, workingset.ServerTypeRemote, cat.Servers[1].Type)
+	assert.Equal(t, "https://example.com/mcp", cat.Servers[1].Endpoint)
+}
+
+func TestCreateFromCommunityRegistryWithMultipleExclusions(t *testing.T) {
+	dao := setupTestDB(t)
+	ctx := t.Context()
+
+	ociServer := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/oci-server",
+			Description: "An OCI server",
+			Version:     "1.0.0",
+			Packages: []model.Package{
+				{
+					RegistryType: "oci",
+					Identifier:   "ghcr.io/example/server:1.0.0",
+					Transport:    model.Transport{Type: "stdio"},
+				},
+			},
+		},
+	}
+	blockedServer1 := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/blocked-one",
+			Description: "First blocked server",
+			Version:     "1.0.0",
+			Packages: []model.Package{
+				{
+					RegistryType: "oci",
+					Identifier:   "ghcr.io/example/blocked1:1.0.0",
+					Transport:    model.Transport{Type: "stdio"},
+				},
+			},
+		},
+	}
+	blockedServer2 := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/blocked-two",
+			Description: "Second blocked server",
+			Version:     "1.0.0",
+			Remotes: []model.Transport{
+				{
+					Type: "sse",
+					URL:  "https://example.com/blocked2",
+				},
+			},
+		},
+	}
+	remoteServer := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/remote-server",
+			Description: "A remote server",
+			Version:     "2.0.0",
+			Remotes: []model.Transport{
+				{
+					Type: "sse",
+					URL:  "https://example.com/mcp",
+				},
+			},
+		},
+	}
+
+	mockClient := mocks.NewMockRegistryAPIClient(
+		mocks.WithListServersResponse([]v0.ServerResponse{ociServer, blockedServer1, blockedServer2, remoteServer}),
+	)
+
+	// Exclude two servers and include a non-existent name (should be a no-op)
+	excludeList := []string{"io.example/blocked-one", "io.example/blocked-two", "io.example/does-not-exist"}
+
+	output := captureStdout(t, func() {
+		err := Create(ctx, dao, mockClient, getMockOciService(), "test/multi-exclude:latest", CreateOptions{
+			CommunityRegistryRef: "registry.modelcontextprotocol.io",
+			Title:                "MCP Community Registry",
+			ExcludeServers:       excludeList,
+		})
+		require.NoError(t, err)
+	})
+	assert.Contains(t, output, "Catalog test/multi-exclude:latest created")
+
+	catalogs, err := dao.ListCatalogs(ctx)
+	require.NoError(t, err)
+	require.Len(t, catalogs, 1)
+
+	cat := NewFromDb(&catalogs[0])
+	// Should have 2 servers (OCI + remote), both blocked servers excluded
+	require.Len(t, cat.Servers, 2)
+
+	// Verify neither blocked server is present
+	for _, s := range cat.Servers {
+		assert.NotEqual(t, "ghcr.io/example/blocked1:1.0.0", s.Image, "blocked-one should not appear")
+		if s.Endpoint != "" {
+			assert.NotEqual(t, "https://example.com/blocked2", s.Endpoint, "blocked-two should not appear")
+		}
+	}
+
+	// Verify the non-blocked servers are present
+	assert.Equal(t, workingset.ServerTypeImage, cat.Servers[0].Type)
+	assert.Equal(t, "ghcr.io/example/server:1.0.0", cat.Servers[0].Image)
+
+	assert.Equal(t, workingset.ServerTypeRemote, cat.Servers[1].Type)
+	assert.Equal(t, "https://example.com/mcp", cat.Servers[1].Endpoint)
+}
+
+func TestCreateFromCommunityRegistryError(t *testing.T) {
+	dao := setupTestDB(t)
+	ctx := t.Context()
+
+	mockClient := mocks.NewMockRegistryAPIClient(
+		mocks.WithListServersError(fmt.Errorf("connection refused")),
+	)
+
+	err := Create(ctx, dao, mockClient, getMockOciService(), "test/community:latest", CreateOptions{
+		CommunityRegistryRef: "registry.example.com",
+		Title:                "Test",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to create catalog from community registry")
+}
+
+func TestCreateFromCommunityRegistryAllIncompatible(t *testing.T) {
+	dao := setupTestDB(t)
+	ctx := t.Context()
+
+	// All servers are incompatible (npm only) — catalog should have 0 usable servers
+	npmServer := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:    "io.example/npm-only",
+			Version: "1.0.0",
+			Packages: []model.Package{
+				{
+					RegistryType: "npm",
+					Identifier:   "@example/server",
+				},
+			},
+		},
+	}
+
+	mockClient := mocks.NewMockRegistryAPIClient(
+		mocks.WithListServersResponse([]v0.ServerResponse{npmServer}),
+	)
+
+	output := captureStdout(t, func() {
+		err := Create(ctx, dao, mockClient, getMockOciService(), "test/all-skipped:latest", CreateOptions{
+			CommunityRegistryRef: "registry.example.com",
+			Title:                "All Skipped",
+		})
+		require.NoError(t, err)
+	})
+	assert.Contains(t, output, "Catalog test/all-skipped:latest created")
+
+	catalogs, err := dao.ListCatalogs(ctx)
+	require.NoError(t, err)
+	require.Len(t, catalogs, 1)
+
+	cat := NewFromDb(&catalogs[0])
+	assert.Equal(t, "All Skipped", cat.Title)
+	assert.Equal(t, "registry:registry.example.com", cat.Source)
+	// All servers were incompatible, so no usable servers in catalog
+	for _, s := range cat.Servers {
+		assert.Nil(t, s.Snapshot, "incompatible servers should not produce snapshots")
 	}
 }

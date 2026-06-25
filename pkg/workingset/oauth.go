@@ -8,15 +8,27 @@ import (
 	"github.com/docker/mcp-gateway/pkg/oauth"
 )
 
+// registerWithSnapshotFunc and registerForDynamicDiscoveryFunc are the
+// Desktop registration functions. Tests can override these to avoid
+// requiring a running Docker Desktop backend.
+var (
+	isCEModeFunc                    = oauth.IsCEMode
+	shouldUseGatewayOAuthFunc       = oauth.ShouldUseGatewayOAuth
+	registerWithSnapshotFunc        = oauth.RegisterProviderWithSnapshot
+	registerForDynamicDiscoveryFunc = oauth.RegisterProviderForDynamicDiscovery
+)
+
 // RegisterOAuthProvidersForServers registers OAuth providers with Docker Desktop
 // for any remote OAuth servers in the list. This enables servers to appear
 // in the OAuth tab for authorization.
 //
 // This function is idempotent and safe to call multiple times for the same servers.
-// In CE mode, this is a no-op since OAuth DCR happens during the authorize command.
+// When the Gateway owns OAuth for a server (CE mode, or Desktop + community
+// server), Desktop registration is skipped -- DCR happens during the authorize
+// command instead.
 func RegisterOAuthProvidersForServers(ctx context.Context, servers []Server) {
-	// Skip in CE mode - DCR happens during oauth authorize command
-	if oauth.IsCEMode() {
+	// CE mode: all OAuth is Gateway-owned, skip Desktop registration entirely.
+	if isCEModeFunc() {
 		return
 	}
 
@@ -24,14 +36,21 @@ func RegisterOAuthProvidersForServers(ctx context.Context, servers []Server) {
 		if server.Snapshot == nil {
 			continue
 		}
-		if !server.Snapshot.Server.IsRemoteOAuthServer() {
-			continue
-		}
 
-		serverName := server.Snapshot.Server.Name
-		if err := oauth.RegisterProviderForLazySetup(ctx, serverName); err != nil {
-			// Log warning but don't fail - user can authorize later via CLI
-			log.Log(fmt.Sprintf("Warning: Failed to register OAuth provider for %s: %v", serverName, err))
+		if server.Snapshot.Server.HasExplicitOAuthProviders() {
+			serverName := server.Snapshot.Server.Name
+			providerName := server.Snapshot.Server.OAuth.Providers[0].Provider
+
+			if err := registerWithSnapshotFunc(ctx, serverName, providerName); err != nil {
+				log.Log(fmt.Sprintf("Warning: Failed to register OAuth provider for %s: %v", serverName, err))
+			}
+		} else if server.Snapshot.Server.Type == "remote" && server.Snapshot.Server.Remote.URL != "" {
+			// Remote servers without oauth.providers: probe for OAuth dynamically
+			serverName := server.Snapshot.Server.Name
+			serverURL := server.Snapshot.Server.Remote.URL
+			if err := registerForDynamicDiscoveryFunc(ctx, serverName, serverURL); err != nil {
+				log.Log(fmt.Sprintf("Warning: Failed dynamic OAuth discovery for %s: %v", serverName, err))
+			}
 		}
 	}
 }

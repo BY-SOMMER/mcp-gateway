@@ -9,6 +9,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/docker/mcp-gateway/pkg/log"
+	"github.com/docker/mcp-gateway/pkg/policy"
+	policycli "github.com/docker/mcp-gateway/pkg/policy/cli"
 	"github.com/docker/mcp-gateway/pkg/prompts"
 	// "github.com/docker/mcp-gateway/pkg/prompts"
 )
@@ -32,6 +34,16 @@ func (g *Gateway) reloadConfiguration(ctx context.Context, configuration Configu
 		return fmt.Errorf("listing resources: %w", err)
 	}
 	log.Log(">", len(capabilities.Tools), "tools listed in", time.Since(startList))
+
+	capabilities = g.filterToolCapabilitiesByPolicy(ctx, configuration, capabilities, "tool")
+	capabilities = g.filterPromptCapabilitiesByPolicy(ctx, configuration, capabilities)
+
+	if err := validateExternalToolNameCollisions(capabilities.Tools, nil); err != nil {
+		return err
+	}
+	if err := validateExternalCapabilityNameCollisions(capabilities, capabilityNameIndexes{}, g.DynamicTools); err != nil {
+		return err
+	}
 
 	// Update capabilities
 	// Clear existing capabilities per server and register new ones
@@ -86,7 +98,7 @@ func (g *Gateway) reloadConfiguration(ctx context.Context, configuration Configu
 		if g.embeddingsClient != nil {
 			handler = embeddingStrategy(g)
 		} else {
-			handler = keywordStrategy(configuration)
+			handler = bm25Strategy(g)
 		}
 		log.Log("  > mcp-find: tool for finding MCP servers in the catalog")
 		mcpFindTool := g.createMcpFindTool(configuration, handler)
@@ -238,6 +250,111 @@ func diffStringSlices(older, newer []string) (additions, removals []string) {
 	return additions, removals
 }
 
+func (g *Gateway) filterToolCapabilitiesByPolicy(ctx context.Context, configuration Configuration, caps *Capabilities, logLabel string) *Capabilities {
+	if caps == nil {
+		return &Capabilities{}
+	}
+
+	toolAllowed := make([]bool, len(caps.Tools))
+	if g.policyClient != nil && len(caps.Tools) > 0 {
+		requests := make([]policy.Request, len(caps.Tools))
+		for i, tool := range caps.Tools {
+			requests[i] = configuration.policyRequest(
+				tool.ServerName, tool.Tool.Name, policy.ActionLoad,
+			)
+		}
+		decisions, err := g.policyClient.EvaluateBatch(ctx, requests)
+		decisions, err = policycli.NormalizeBatchDecisions(requests, decisions, err)
+		for i, req := range requests {
+			event := buildAuditEvent(req, decisions[i], nil, nil)
+			submitAuditEvent(g.policyClient, event)
+		}
+		if err != nil {
+			// Fail-closed: deny all tools on batch error.
+			log.Logf("batch policy check failed for %ss: %v (denying all)", logLabel, err)
+		} else {
+			for i, dec := range decisions {
+				if dec.Allowed && dec.Error == "" {
+					toolAllowed[i] = true
+					continue
+				}
+				tool := caps.Tools[i]
+				if dec.Error != "" {
+					log.Logf("policy check failed for %s %s/%s: %s (denying)",
+						logLabel, tool.ServerName, tool.Tool.Name, dec.Error)
+					continue
+				}
+				log.Logf("policy denied %s %s/%s: %s",
+					logLabel, tool.ServerName, tool.Tool.Name, dec.Reason)
+			}
+		}
+	} else {
+		// No policy client - allow all tools.
+		for i := range toolAllowed {
+			toolAllowed[i] = true
+		}
+	}
+
+	return filterCapabilitiesByAllowedTools(caps, toolAllowed)
+}
+
+func (g *Gateway) filterPromptCapabilitiesByPolicy(ctx context.Context, configuration Configuration, caps *Capabilities) *Capabilities {
+	if caps == nil {
+		return &Capabilities{}
+	}
+
+	promptAllowed := make([]bool, len(caps.Prompts))
+	if g.policyClient != nil && len(caps.Prompts) > 0 {
+		requests := make([]policy.Request, len(caps.Prompts))
+		for i, prompt := range caps.Prompts {
+			requests[i] = configuration.policyRequest(
+				prompt.ServerName, prompt.Prompt.Name, policy.ActionPrompt,
+			)
+		}
+		decisions, err := g.policyClient.EvaluateBatch(ctx, requests)
+		decisions, err = policycli.NormalizeBatchDecisions(requests, decisions, err)
+		for i, req := range requests {
+			event := buildAuditEvent(req, decisions[i], nil, nil)
+			submitAuditEvent(g.policyClient, event)
+		}
+		if err != nil {
+			log.Logf("batch policy check failed for prompts: %v (denying all)", err)
+		} else {
+			for i, dec := range decisions {
+				if dec.Allowed && dec.Error == "" {
+					promptAllowed[i] = true
+					continue
+				}
+				prompt := caps.Prompts[i]
+				if dec.Error != "" {
+					log.Logf("policy check failed for prompt %s/%s: %s (denying)",
+						prompt.ServerName, prompt.Prompt.Name, dec.Error)
+					continue
+				}
+				log.Logf("policy denied prompt %s/%s: %s",
+					prompt.ServerName, prompt.Prompt.Name, dec.Reason)
+			}
+		}
+	} else {
+		// No policy client - allow all prompts.
+		for i := range promptAllowed {
+			promptAllowed[i] = true
+		}
+	}
+
+	filtered := &Capabilities{
+		Tools:             caps.Tools,
+		Resources:         caps.Resources,
+		ResourceTemplates: caps.ResourceTemplates,
+	}
+	for i, prompt := range caps.Prompts {
+		if i < len(promptAllowed) && promptAllowed[i] {
+			filtered.Prompts = append(filtered.Prompts, prompt)
+		}
+	}
+	return filtered
+}
+
 // allCapabilities builds a ServerCapabilities struct from the available capabilities for a server.
 // This function expects g.capabilitiesMu to be locked by the caller.
 func (g *Gateway) allCapabilities(serverName string) *ServerCapabilities {
@@ -292,8 +409,27 @@ func (g *Gateway) reloadServerCapabilities(ctx context.Context, serverName strin
 		oldCaps = &ServerCapabilities{}
 	}
 
-	// Store the full capabilities
-	g.serverAvailableCapabilities[serverName] = newServerCaps
+	allowedServerCaps := g.filterToolCapabilitiesByPolicy(ctx, g.configuration, newServerCaps, "dynamic tool")
+	allowedServerCaps = g.filterPromptCapabilitiesByPolicy(ctx, g.configuration, allowedServerCaps)
+
+	existingToolRegistrations := make(map[string]ToolRegistration, len(g.toolRegistrations))
+	for toolName, registration := range g.toolRegistrations {
+		if registration.ServerName == serverName {
+			continue
+		}
+		existingToolRegistrations[toolName] = registration
+	}
+
+	if err := validateExternalToolNameCollisions(allowedServerCaps.Tools, existingToolRegistrations); err != nil {
+		return nil, err
+	}
+	if err := validateExternalCapabilityNameCollisions(allowedServerCaps, g.registeredCapabilityNameIndexes(serverName), g.DynamicTools); err != nil {
+		return nil, err
+	}
+
+	// Store the policy-filtered capabilities. updateServerCapabilities reads
+	// from this map, so denied tools must not remain here.
+	g.serverAvailableCapabilities[serverName] = allowedServerCaps
 
 	// Update tool registrations for this server
 	// This happens regardless of activation so tools can be called via mcp-exec
@@ -303,16 +439,45 @@ func (g *Gateway) reloadServerCapabilities(ctx context.Context, serverName strin
 			delete(g.toolRegistrations, toolName)
 		}
 	}
-	// Add new tool registrations from the server
-	for _, tool := range newServerCaps.Tools {
+
+	// Add new tool registrations from the server (with policy filtering).
+	for _, tool := range allowedServerCaps.Tools {
 		g.toolRegistrations[tool.Tool.Name] = tool
 	}
 
 	// Return old capabilities for the caller to use with updateServerCapabilities
 	// The caller should use g.allCapabilities(serverName) to get newCaps
-	// The full capabilities (newServerCaps) are now in g.serverAvailableCapabilities[serverName]
+	// The filtered capabilities are now in g.serverAvailableCapabilities[serverName]
 	// g.serverCapabilities will be set by updateServerCapabilities after all updates succeed
 	return oldCaps, nil
+}
+
+// registeredCapabilityNameIndexes builds indexes for capabilities currently
+// registered in the MCP server. This function expects g.capabilitiesMu to be
+// locked by the caller.
+func (g *Gateway) registeredCapabilityNameIndexes(excludeServerName string) capabilityNameIndexes {
+	indexes := capabilityNameIndexes{
+		Prompts:           make(map[string]string),
+		Resources:         make(map[string]string),
+		ResourceTemplates: make(map[string]string),
+	}
+
+	for serverName, caps := range g.serverCapabilities {
+		if serverName == excludeServerName || caps == nil {
+			continue
+		}
+		for _, promptName := range caps.PromptNames {
+			indexes.Prompts[promptName] = serverName
+		}
+		for _, resourceURI := range caps.ResourceURIs {
+			indexes.Resources[resourceURI] = serverName
+		}
+		for _, resourceTemplateURI := range caps.ResourceTemplateURIs {
+			indexes.ResourceTemplates[resourceTemplateURI] = serverName
+		}
+	}
+
+	return indexes
 }
 
 // updateServerCapabilities updates g.mcpServer with capabilities from the server.
@@ -340,6 +505,10 @@ func (g *Gateway) updateServerCapabilities(serverName string, oldCaps, newCaps *
 		len(addedTemplates) == 0 && len(removedTemplates) == 0 {
 		log.Log("  - No capability changes detected for", serverName, "- skipping update")
 		return nil
+	}
+
+	if err := validateExternalCapabilityNameCollisions(newServerCaps, g.registeredCapabilityNameIndexes(serverName), g.DynamicTools); err != nil {
+		return err
 	}
 
 	// Remove old capabilities that are no longer present
@@ -443,6 +612,14 @@ func (g *Gateway) removeServerConfiguration(_ context.Context, serverName string
 	if len(oldCaps.ToolNames) > 0 {
 		g.mcpServer.RemoveTools(oldCaps.ToolNames...)
 		log.Log("  - Removed", len(oldCaps.ToolNames), "tools for", serverName)
+		for _, toolName := range oldCaps.ToolNames {
+			delete(g.toolRegistrations, toolName)
+		}
+	}
+	for toolName, registration := range g.toolRegistrations {
+		if registration.ServerName == serverName {
+			delete(g.toolRegistrations, toolName)
+		}
 	}
 
 	if len(oldCaps.PromptNames) > 0 {
@@ -462,6 +639,7 @@ func (g *Gateway) removeServerConfiguration(_ context.Context, serverName string
 
 	// Update tracking with new capabilities
 	delete(g.serverCapabilities, serverName)
+	delete(g.serverAvailableCapabilities, serverName)
 
 	return nil
 }

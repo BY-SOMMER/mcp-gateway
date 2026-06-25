@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/docker/mcp-gateway/pkg/db"
 	"github.com/docker/mcp-gateway/pkg/log"
 	"github.com/docker/mcp-gateway/pkg/oci"
+	"github.com/docker/mcp-gateway/pkg/policy"
 	"github.com/docker/mcp-gateway/pkg/registryapi"
 	"github.com/docker/mcp-gateway/pkg/sliceutil"
 	"github.com/docker/mcp-gateway/pkg/validate"
@@ -35,6 +37,8 @@ type WorkingSet struct {
 	Name    string            `yaml:"name" json:"name" validate:"required,min=1"`
 	Servers []Server          `yaml:"servers" json:"servers" validate:"dive"`
 	Secrets map[string]Secret `yaml:"secrets,omitempty" json:"secrets,omitempty" validate:"dive"`
+	// Policy describes the policy decision for this working set.
+	Policy *policy.Decision `yaml:"policy,omitempty" json:"policy,omitempty"`
 }
 
 type ServerType string
@@ -51,6 +55,8 @@ type Server struct {
 	Config  map[string]any `yaml:"config,omitempty" json:"config,omitempty"`
 	Secrets string         `yaml:"secrets,omitempty" json:"secrets,omitempty"`
 	Tools   ToolList       `yaml:"tools,omitempty" json:"tools"` // See IsZero() below
+	// Policy describes the policy decision for this server.
+	Policy *policy.Decision `yaml:"policy,omitempty" json:"policy,omitempty"`
 
 	// ServerTypeRegistry only
 	Source string `yaml:"source,omitempty" json:"source,omitempty" validate:"required_if=Type registry"`
@@ -60,6 +66,10 @@ type Server struct {
 
 	// ServerTypeRemote only
 	Endpoint string `yaml:"endpoint,omitempty" json:"endpoint,omitempty" validate:"required_if=Type remote"`
+
+	// CatalogRef is the catalog reference that this server was sourced from.
+	// Empty if the server was added directly (not from a catalog).
+	CatalogRef string `yaml:"catalog_ref,omitempty" json:"catalogRef,omitempty"`
 
 	// Optional snapshot of the server schema
 	Snapshot *ServerSnapshot `yaml:"snapshot,omitempty" json:"snapshot,omitempty"`
@@ -92,10 +102,11 @@ func NewFromDb(dbSet *db.WorkingSet) WorkingSet {
 	servers := make([]Server, len(dbSet.Servers))
 	for i, server := range dbSet.Servers {
 		servers[i] = Server{
-			Type:    ServerType(server.Type),
-			Config:  server.Config,
-			Secrets: server.Secrets,
-			Tools:   server.Tools,
+			Type:       ServerType(server.Type),
+			Config:     server.Config,
+			Secrets:    server.Secrets,
+			Tools:      server.Tools,
+			CatalogRef: server.CatalogRef,
 		}
 		if server.Type == "registry" {
 			servers[i].Source = server.Source
@@ -136,10 +147,11 @@ func (workingSet WorkingSet) ToDb() db.WorkingSet {
 	dbServers := make(db.ServerList, len(workingSet.Servers))
 	for i, server := range workingSet.Servers {
 		dbServers[i] = db.Server{
-			Type:    string(server.Type),
-			Config:  server.Config,
-			Secrets: server.Secrets,
-			Tools:   server.Tools,
+			Type:       string(server.Type),
+			Config:     server.Config,
+			Secrets:    server.Secrets,
+			Tools:      server.Tools,
+			CatalogRef: server.CatalogRef,
 		}
 		if server.Type == ServerTypeRegistry {
 			dbServers[i].Source = server.Source
@@ -344,35 +356,20 @@ func (s *Server) BasicName() string {
 }
 
 func createWorkingSetID(ctx context.Context, name string, dao db.DAO) (string, error) {
-	// Replace all non-alphanumeric characters with a hyphen and make all uppercase lowercase
+	// Replace all non-alphanumeric characters with an underscore and make all uppercase lowercase
 	re := regexp.MustCompile("[^a-zA-Z0-9]+")
-	cleaned := re.ReplaceAllString(name, "-")
+	cleaned := re.ReplaceAllString(name, "_")
 	baseName := strings.ToLower(cleaned)
 
-	existingSets, err := dao.FindWorkingSetsByIDPrefix(ctx, baseName)
-	if err != nil {
-		return "", fmt.Errorf("failed to find profiles by name prefix: %w", err)
+	_, err := dao.GetWorkingSet(ctx, baseName)
+	if err == nil {
+		return "", fmt.Errorf("a profile with id %q already exists", baseName)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("failed to look for existing profile: %w", err)
 	}
 
-	if len(existingSets) == 0 {
-		return baseName, nil
-	}
-
-	takenIDs := make(map[string]bool)
-	for _, set := range existingSets {
-		takenIDs[set.ID] = true
-	}
-
-	// TODO(cody): there are better ways to do this, but this is a simple brute force for now
-	// Append a number to the base name
-	for i := 2; i <= 100; i++ {
-		newName := fmt.Sprintf("%s-%d", baseName, i)
-		if !takenIDs[newName] {
-			return newName, nil
-		}
-	}
-
-	return "", fmt.Errorf("failed to create profile id")
+	return baseName, nil
 }
 
 func ResolveServersFromString(ctx context.Context, registryClient registryapi.Client, ociService oci.Service, dao db.DAO, value string) ([]Server, error) {
@@ -394,24 +391,65 @@ func ResolveServersFromString(ctx context.Context, registryClient registryapi.Cl
 	} else if v, ok := strings.CutPrefix(value, "catalog://"); ok {
 		return ResolveCatalogServers(ctx, dao, v)
 	} else if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") { // Assume registry entry if it's a URL
-		url, err := ResolveRegistry(ctx, registryClient, value)
+		server, err := ResolveRegistry(ctx, registryClient, value)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve registry: %w", err)
 		}
-		return []Server{{
-			Type:    ServerTypeRegistry,
-			Source:  url,
-			Secrets: "default",
-			// TODO(cody): add snapshot
-		}}, nil
-	} else if v, ok := strings.CutPrefix(value, "file://"); ok {
-		return ResolveFile(v)
+		return []Server{server}, nil
+	} else if path, ok := strings.CutPrefix(value, "file://"); ok {
+		path, err := parseLocalFileReference(path, value)
+		if err != nil {
+			return nil, err
+		}
+		return ResolveFile(ctx, path)
 	}
 	return nil, fmt.Errorf("invalid server value: %s", value)
 }
 
-func ResolveFile(value string) ([]Server, error) {
-	buf, err := os.ReadFile(value)
+func parseLocalFileReference(path, value string) (string, error) {
+	// Docker MCP treats file:// as a catalog-root-relative local file reference,
+	// not as an RFC file URI with a host component. Decode escapes before the
+	// catalog resolver applies the trusted-root boundary.
+	decodedPath, err := url.PathUnescape(path)
+	if err != nil {
+		return "", fmt.Errorf("invalid local file reference %q: %w", value, err)
+	}
+	return decodedPath, nil
+}
+
+// isV0ServerJSON checks if the JSON data represents a v0.ServerJSON/v0.ServerResponse
+// rather than a catalog.Server by looking for discriminating fields.
+func isV0ServerJSON(buf []byte) bool {
+	var discriminator struct {
+		Schema   string `json:"$schema"`  // Present in v0.ServerJSON
+		Type     string `json:"type"`     // Present in catalog.Server (required)
+		Packages []any  `json:"packages"` // Present in v0.ServerJSON
+		Remotes  []any  `json:"remotes"`  // Present in v0.ServerJSON
+	}
+	if err := json.Unmarshal(buf, &discriminator); err != nil {
+		return false
+	}
+
+	// If it has the catalog.Server-specific "type" field, it's NOT a v0.ServerJSON
+	if discriminator.Type != "" {
+		return false
+	}
+
+	// If it has v0.ServerJSON-specific fields, it IS a v0.ServerJSON
+	if discriminator.Schema != "" || len(discriminator.Packages) > 0 || len(discriminator.Remotes) > 0 {
+		return true
+	}
+
+	return false
+}
+
+func ResolveFile(ctx context.Context, value string) ([]Server, error) {
+	path, err := catalog.ResolveLocalCatalogPath(value)
+	if err != nil {
+		return nil, err
+	}
+
+	buf, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
@@ -423,7 +461,7 @@ func ResolveFile(value string) ([]Server, error) {
 	}
 
 	var servers []catalog.Server
-	switch filepath.Ext(strings.ToLower(value)) {
+	switch filepath.Ext(strings.ToLower(path)) {
 	case ".yaml", ".yml":
 		if err := yaml.Unmarshal(buf, &probe); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal server: %w", err)
@@ -441,15 +479,45 @@ func ResolveFile(value string) ([]Server, error) {
 			return nil, fmt.Errorf("failed to unmarshal server: %w", err)
 		}
 		if probe.Registry == nil {
-			// Fallback to parsing single server
-			var server catalog.Server
-			if err := json.Unmarshal(buf, &server); err != nil {
-				return nil, fmt.Errorf("failed to unmarshal server: %w", err)
+			// Use discriminating fields to determine type
+			if isV0ServerJSON(buf) {
+				// Try to parse as v0.ServerResponse first
+				var serverResp v0.ServerResponse
+				if err := json.Unmarshal(buf, &serverResp); err == nil && serverResp.Server.Name != "" {
+					// Successfully parsed as v0.ServerResponse
+					catalogServer, _, err := ConvertRegistryServerToCatalog(ctx, &serverResp, catalog.WithPyPIResolver(catalog.DefaultPyPIVersionResolver()), catalog.WithNPMResolver(catalog.DefaultNPMVersionResolver()))
+					if err != nil {
+						return nil, fmt.Errorf("failed to convert v0.ServerResponse to catalog.Server: %w", err)
+					}
+					servers = []catalog.Server{catalogServer}
+				} else {
+					// Try to parse as v0.ServerJSON and wrap it
+					var serverJSON v0.ServerJSON
+					if err := json.Unmarshal(buf, &serverJSON); err == nil && serverJSON.Name != "" {
+						// Successfully parsed as v0.ServerJSON, wrap it in ServerResponse
+						serverResp := &v0.ServerResponse{
+							Server: serverJSON,
+						}
+						catalogServer, _, err := ConvertRegistryServerToCatalog(ctx, serverResp, catalog.WithPyPIResolver(catalog.DefaultPyPIVersionResolver()), catalog.WithNPMResolver(catalog.DefaultNPMVersionResolver()))
+						if err != nil {
+							return nil, fmt.Errorf("failed to convert v0.ServerJSON to catalog.Server: %w", err)
+						}
+						servers = []catalog.Server{catalogServer}
+					} else {
+						return nil, fmt.Errorf("failed to parse as v0.ServerJSON despite discriminating fields indicating v0 format")
+					}
+				}
+			} else {
+				// Parse as catalog.Server directly
+				var server catalog.Server
+				if err := json.Unmarshal(buf, &server); err != nil {
+					return nil, fmt.Errorf("failed to unmarshal server as catalog.Server: %w", err)
+				}
+				servers = []catalog.Server{server}
 			}
-			servers = []catalog.Server{server}
 		}
 	default:
-		return nil, fmt.Errorf("unsupported file extension: %s, must be .yaml or .json", value)
+		return nil, fmt.Errorf("unsupported file extension: must be .yaml, .yml, or .json")
 	}
 
 	if probe.Registry != nil {
@@ -579,53 +647,60 @@ func ResolveImageRef(ctx context.Context, ociService oci.Service, value string) 
 	return fullRef, nil
 }
 
-func ResolveRegistry(ctx context.Context, registryClient registryapi.Client, value string) (string, error) {
+func ConvertRegistryServerToCatalog(ctx context.Context, serverResp *v0.ServerResponse, opts ...catalog.TransformOption) (catalog.Server, catalog.TransformSource, error) {
+	result, source, err := catalog.TransformToDocker(ctx, serverResp.Server, opts...)
+	if err != nil {
+		return catalog.Server{}, "", err
+	}
+	return *result, source, nil
+}
+
+func ResolveRegistry(ctx context.Context, registryClient registryapi.Client, value string) (Server, error) {
 	url, err := registryapi.ParseServerURL(value)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse server URL %s: %w", value, err)
+		return Server{}, fmt.Errorf("failed to parse server URL %s: %w", value, err)
 	}
 
 	versions, err := registryClient.GetServerVersions(ctx, url)
 	if err != nil {
-		return "", fmt.Errorf("failed to get server versions from URL %s: %w", url.VersionsListURL(), err)
+		return Server{}, fmt.Errorf("failed to get server versions from URL %s: %w", url.VersionsListURL(), err)
 	}
 
 	if len(versions.Servers) == 0 {
-		return "", fmt.Errorf("no server versions found for URL %s", url.VersionsListURL())
+		return Server{}, fmt.Errorf("no server versions found for URL %s", url.VersionsListURL())
 	}
 
 	if url.IsLatestVersion() {
 		latestVersion, err := resolveLatestVersion(versions)
 		if err != nil {
-			return "", fmt.Errorf("failed to resolve latest version for server %s: %w", url.VersionsListURL(), err)
+			return Server{}, fmt.Errorf("failed to resolve latest version for server %s: %w", url.VersionsListURL(), err)
 		}
 		url = url.WithVersion(latestVersion)
 	}
 
-	var server *v0.ServerResponse
+	var serverResp *v0.ServerResponse
 	for _, version := range versions.Servers {
 		if version.Server.Version == url.Version {
-			server = &version
+			serverResp = &version
 			break
 		}
 	}
-	if server == nil {
-		return "", fmt.Errorf("server version not found")
+	if serverResp == nil {
+		return Server{}, fmt.Errorf("server version not found")
 	}
 
-	// check oci package exists
-	foundOCIPackage := false
-	for _, pkg := range server.Server.Packages {
-		if pkg.RegistryType == "oci" {
-			foundOCIPackage = true
-			break
-		}
-	}
-	if !foundOCIPackage {
-		return "", fmt.Errorf("oci package not found for server %s", url.String())
+	// Check for OCI packages and convert to catalog format
+	catalogServer, _, err := ConvertRegistryServerToCatalog(ctx, serverResp, catalog.WithPyPIResolver(catalog.DefaultPyPIVersionResolver()), catalog.WithNPMResolver(catalog.DefaultNPMVersionResolver()))
+	if err != nil {
+		return Server{}, fmt.Errorf("failed to convert registry server: %w", err)
 	}
 
-	return url.String(), nil
+	return Server{
+		Type:     ServerTypeRegistry,
+		Source:   url.String(),
+		Secrets:  "default",
+		Snapshot: &ServerSnapshot{Server: catalogServer},
+	}, nil
 }
 
 func ResolveSnapshot(ctx context.Context, ociService oci.Service, server Server) (*ServerSnapshot, error) {
@@ -633,7 +708,7 @@ func ResolveSnapshot(ctx context.Context, ociService oci.Service, server Server)
 	case ServerTypeImage:
 		return ResolveImageSnapshot(ctx, ociService, server.Image)
 	case ServerTypeRegistry:
-		// TODO(cody): add snapshot
+		// Snapshots for registry servers are resolved during ResolveRegistry
 		return nil, nil //nolint:nilnil
 	case ServerTypeRemote:
 		// TODO(bobby): add snapshot when you can add remotes directly from URL
@@ -692,11 +767,12 @@ func getCatalogServerFromImage(ociService oci.Service, img v1.Image, name string
 	}
 
 	// Basic parsing validation
-	var server catalog.Server
-	if err := yaml.Unmarshal([]byte(metadataLabel), &server); err != nil {
+	var imported catalog.ImportedServer
+	if err := yaml.Unmarshal([]byte(metadataLabel), &imported); err != nil {
 		return catalog.Server{}, fmt.Errorf("failed to parse metadata label for %s: %w", name, err)
 	}
 
+	server := imported.ToServer()
 	server.Type = "server"
 	server.Image = name
 
@@ -707,12 +783,13 @@ func mapCatalogServersToWorkingSetServers(dbServers []db.CatalogServer, secrets 
 	servers := make([]Server, len(dbServers))
 	for i, server := range dbServers {
 		servers[i] = Server{
-			Type:     ServerType(server.ServerType),
-			Tools:    ToolList(server.Tools),
-			Config:   map[string]any{},
-			Source:   server.Source,
-			Image:    server.Image,
-			Endpoint: server.Endpoint,
+			Type:       ServerType(server.ServerType),
+			Tools:      ToolList(server.Tools),
+			Config:     map[string]any{},
+			Source:     server.Source,
+			Image:      server.Image,
+			Endpoint:   server.Endpoint,
+			CatalogRef: server.CatalogRef,
 			Snapshot: &ServerSnapshot{
 				Server: server.Snapshot.Server,
 			},

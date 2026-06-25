@@ -138,6 +138,9 @@ func (m *Manager) ExchangeCode(ctx context.Context, code string, state string) e
 	if err != nil {
 		return fmt.Errorf("DCR client not found for %s: %w", serverName, err)
 	}
+	if err := validateOutboundDCRClientEndpoints(ctx, dcrClient); err != nil {
+		return err
+	}
 
 	// Create provider
 	provider := NewDCRProvider(dcrClient, m.redirectURI)
@@ -153,7 +156,12 @@ func (m *Manager) ExchangeCode(ctx context.Context, code string, state string) e
 		opts = append(opts, oauth2.SetAuthURLParam("resource", provider.ResourceURL()))
 	}
 
-	token, err := config.Exchange(ctx, code, opts...)
+	// Inject proxy transport so the token endpoint is reachable through
+	// Docker Desktop's HTTP proxy when applicable, while blocking unsafe
+	// derived OAuth endpoints.
+	proxyCtx := context.WithValue(ctx, oauth2.HTTPClient, guardedOAuthHTTPClient(ctx, 0))
+
+	token, err := config.Exchange(proxyCtx, code, opts...)
 	if err != nil {
 		return fmt.Errorf("token exchange failed for %s: %w", serverName, err)
 	}

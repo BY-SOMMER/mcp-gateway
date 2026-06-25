@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -40,7 +41,6 @@ type clientPool struct {
 }
 
 type clientConfig struct {
-	readOnly      *bool
 	serverSession *mcp.ServerSession
 	server        *mcp.Server
 }
@@ -101,19 +101,26 @@ func (cp *clientPool) AcquireClient(ctx context.Context, serverConfig *catalog.S
 
 	// No client found, create a new one
 	if getter == nil {
-		getter = newClientGetter(serverConfig, cp, config)
-
 		// If the client is long running, save it for later
 		if cp.longLived(serverConfig, config) {
+			// Double-checked locking: re-check under write lock to avoid duplicate containers
 			c = context.Background()
 			cp.clientLock.Lock()
-			cp.keptClients[key] = keptClient{
-				Name:         serverConfig.Name,
-				Getter:       getter,
-				Config:       serverConfig,
-				ClientConfig: config,
+			if kc, exists := cp.keptClients[key]; exists {
+				// Lost the race; reuse the existing getter
+				getter = kc.Getter
+			} else {
+				getter = newClientGetter(serverConfig, cp, config)
+				cp.keptClients[key] = keptClient{
+					Name:         serverConfig.Name,
+					Getter:       getter,
+					Config:       serverConfig,
+					ClientConfig: config,
+				}
 			}
 			cp.clientLock.Unlock()
+		} else {
+			getter = newClientGetter(serverConfig, cp, config)
 		}
 	}
 
@@ -170,6 +177,29 @@ func (cp *clientPool) SetNetworks(networks []string) {
 	cp.networks = networks
 }
 
+// ReleaseClientsForSession closes and removes all cached clients for the given session
+func (cp *clientPool) ReleaseClientsForSession(session *mcp.ServerSession) {
+	cp.clientLock.Lock()
+	var toClose []keptClient
+	for key, kc := range cp.keptClients {
+		if key.session == session {
+			toClose = append(toClose, kc)
+			delete(cp.keptClients, key)
+		}
+	}
+	cp.clientLock.Unlock()
+
+	for _, kc := range toClose {
+		if !kc.Getter.started.Load() {
+			continue // GetClient never called; no container to stop
+		}
+		client, err := kc.Getter.GetClient(context.Background()) // should be cached
+		if err == nil {
+			client.Session().Close()
+		}
+	}
+}
+
 // InvalidateOAuthClients closes and removes all OAuth client connections for the specified provider
 // This allows clients to reconnect with updated/refreshed tokens
 func (cp *clientPool) InvalidateOAuthClients(provider string) {
@@ -180,24 +210,23 @@ func (cp *clientPool) InvalidateOAuthClients(provider string) {
 
 	var invalidatedKeys []clientKey
 	for key, keptClient := range cp.keptClients {
-		// Check if this client uses OAuth for the specified provider
-		if keptClient.Config.Spec.OAuth != nil {
-			// Match by server name (for DCR providers, server name matches provider)
-			if keptClient.Config.Name == provider {
-				log.Log(fmt.Sprintf("ClientPool: Closing OAuth connection for server: %s", keptClient.Config.Name))
+		// Check if this remote client matches the OAuth provider
+		// Matches both catalog servers (explicit OAuth metadata) and community servers
+		// (dynamic OAuth discovery via DCR without Spec.OAuth)
+		if keptClient.Config.Name == provider && keptClient.Config.IsRemote() {
+			log.Log(fmt.Sprintf("ClientPool: Closing OAuth connection for server: %s", keptClient.Config.Name))
 
-				// Close the connection
-				client, err := keptClient.Getter.GetClient(context.TODO())
-				if err == nil {
-					client.Session().Close()
-					log.Log(fmt.Sprintf("ClientPool: Successfully closed connection for %s", keptClient.Config.Name))
-				} else {
-					log.Log(fmt.Sprintf("ClientPool: Warning - failed to get client for %s during invalidation: %v", keptClient.Config.Name, err))
-				}
-
-				// Mark for removal from kept clients
-				invalidatedKeys = append(invalidatedKeys, key)
+			// Close the connection
+			client, err := keptClient.Getter.GetClient(context.TODO())
+			if err == nil {
+				client.Session().Close()
+				log.Log(fmt.Sprintf("ClientPool: Successfully closed connection for %s", keptClient.Config.Name))
+			} else {
+				log.Log(fmt.Sprintf("ClientPool: Warning - failed to get client for %s during invalidation: %v", keptClient.Config.Name, err))
 			}
+
+			// Mark for removal from kept clients
+			invalidatedKeys = append(invalidatedKeys, key)
 		}
 	}
 
@@ -232,6 +261,19 @@ func (cp *clientPool) runToolContainer(ctx context.Context, tool catalog.Tool, p
 		if mount == "" {
 			continue
 		}
+		if !isSafeFlagValue(mount) {
+			log.Logf("Warning: tool '%s' has volume value that looks like a flag, skipping: %q", tool.Name, mount)
+			continue
+		}
+		mount, err := normalizeDockerVolumeBind(mount)
+		if err != nil {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{
+					Text: fmt.Sprintf("validate volume for %s: %v", tool.Name, err),
+				}},
+				IsError: true,
+			}, nil
+		}
 
 		args = append(args, "-v", mount)
 	}
@@ -240,7 +282,11 @@ func (cp *clientPool) runToolContainer(ctx context.Context, tool catalog.Tool, p
 	if tool.Container.User != "" {
 		userVal := fmt.Sprintf("%v", eval.Evaluate(tool.Container.User, arguments))
 		if userVal != "" {
-			args = append(args, "-u", userVal)
+			if !isSafeFlagValue(userVal) {
+				log.Logf("Warning: tool '%s' has user value that looks like a flag, skipping: %q", tool.Name, userVal)
+			} else {
+				args = append(args, "-u", userVal)
+			}
 		}
 	}
 
@@ -292,7 +338,8 @@ func (cp *clientPool) baseArgs(name string) []string {
 	}
 
 	// Add a few labels to the container for identification
-	args = append(args,
+	args = append(
+		args,
 		"-l", "docker-mcp=true",
 		"-l", "docker-mcp-tool-type=mcp",
 		"-l", "docker-mcp-name="+name,
@@ -302,7 +349,7 @@ func (cp *clientPool) baseArgs(name string) []string {
 	return args
 }
 
-func (cp *clientPool) argsAndEnv(serverConfig *catalog.ServerConfig, readOnly *bool, targetConfig proxies.TargetConfig) ([]string, []string) {
+func (cp *clientPool) argsAndEnv(serverConfig *catalog.ServerConfig, targetConfig proxies.TargetConfig) ([]string, []string, error) {
 	args := cp.baseArgs(serverConfig.Name)
 	var env []string
 
@@ -334,6 +381,9 @@ func (cp *clientPool) argsAndEnv(serverConfig *catalog.ServerConfig, readOnly *b
 
 		secretValue, ok := serverConfig.Secrets[s.Name]
 		if ok {
+			if cp.Verbose {
+				log.Logf("    - %s: %s", s.Env, maskSecret(secretValue))
+			}
 			env = append(env, fmt.Sprintf("%s=%s", s.Env, secretValue))
 		} else {
 			log.Logf("Warning: Secret '%s' not found for server '%s', setting %s=<UNKNOWN>", s.Name, serverConfig.Name, s.Env)
@@ -361,15 +411,16 @@ func (cp *clientPool) argsAndEnv(serverConfig *catalog.ServerConfig, readOnly *b
 		if mount == "" {
 			continue
 		}
-
-		// For long-lived servers, never mount volumes as read-only
-		// because the container will be shared across multiple tool calls
-		isLongLived := serverConfig.Spec.LongLived || cp.LongLived
-		if !isLongLived && readOnly != nil && *readOnly && !strings.HasSuffix(mount, ":ro") {
-			args = append(args, "-v", mount+":ro")
-		} else {
-			args = append(args, "-v", mount)
+		if !isSafeFlagValue(mount) {
+			log.Logf("Warning: server '%s' has volume value that looks like a flag, skipping: %q", serverConfig.Name, mount)
+			continue
 		}
+		mount, err := normalizeDockerVolumeBind(mount)
+		if err != nil {
+			return nil, nil, fmt.Errorf("validate volume for %s: %w", serverConfig.Name, err)
+		}
+
+		args = append(args, "-v", mount)
 	}
 
 	// User
@@ -379,18 +430,34 @@ func (cp *clientPool) argsAndEnv(serverConfig *catalog.ServerConfig, readOnly *b
 			val = fmt.Sprintf("%v", eval.Evaluate(val, serverConfig.Config))
 		}
 		if val != "" {
-			args = append(args, "-u", val)
+			if !isSafeFlagValue(val) {
+				log.Logf("Warning: server '%s' has user value that looks like a flag, skipping: %q", serverConfig.Name, val)
+			} else {
+				args = append(args, "-u", val)
+			}
 		}
 	}
 
 	// Extra hosts (for /etc/hosts entries)
 	for _, host := range serverConfig.Spec.ExtraHosts {
-		if host != "" {
-			args = append(args, "--add-host", host)
+		if host == "" {
+			continue
 		}
+		if !isSafeFlagValue(host) {
+			log.Logf("Warning: server '%s' has extra-host value that looks like a flag, skipping: %q", serverConfig.Name, host)
+			continue
+		}
+		args = append(args, "--add-host", host)
 	}
 
-	return args, env
+	return args, env, nil
+}
+
+// isSafeFlagValue reports whether v can be safely appended to a docker run
+// argv after a flag like -v, -u, or --add-host. Values that start with '-'
+// would be reparsed by docker as further options.
+func isSafeFlagValue(v string) bool {
+	return v != "" && !strings.HasPrefix(v, "-")
 }
 
 func expandEnv(value string, env []string) string {
@@ -412,10 +479,23 @@ func expandEnvList(values []string, env []string) []string {
 	return expanded
 }
 
+// maskSecret shows the first few characters of a secret followed by asterisks.
+// se:// URIs are shown in full since they're just references, not actual secrets.
+func maskSecret(value string) string {
+	if strings.HasPrefix(value, "se://") {
+		return value
+	}
+	if len(value) <= 4 {
+		return "****"
+	}
+	return value[:4] + "****"
+}
+
 type clientGetter struct {
-	once   sync.Once
-	client mcpclient.Client
-	err    error
+	once    sync.Once
+	started atomic.Bool
+	client  mcpclient.Client
+	err     error
 
 	serverConfig *catalog.ServerConfig
 	cp           *clientPool
@@ -436,6 +516,7 @@ func (cg *clientGetter) IsClient(client mcpclient.Client) bool {
 }
 
 func (cg *clientGetter) GetClient(ctx context.Context) (mcpclient.Client, error) {
+	cg.started.Store(true)
 	cg.once.Do(func() {
 		createClient := func() (mcpclient.Client, error) {
 			cleanup := func(context.Context) error { return nil }
@@ -459,11 +540,10 @@ func (cg *clientGetter) GetClient(ctx context.Context) (mcpclient.Client, error)
 				}
 
 				image := cg.serverConfig.Spec.Image
-				var readOnly *bool
-				if cg.clientConfig != nil {
-					readOnly = cg.clientConfig.readOnly
+				args, env, err := cg.cp.argsAndEnv(cg.serverConfig, targetConfig)
+				if err != nil {
+					return nil, err
 				}
-				args, env := cg.cp.argsAndEnv(cg.serverConfig, readOnly, targetConfig)
 
 				command := expandEnvList(eval.EvaluateList(cg.serverConfig.Spec.Command, cg.serverConfig.Config), env)
 				if len(command) == 0 {

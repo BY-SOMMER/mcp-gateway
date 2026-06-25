@@ -36,12 +36,13 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli, features featur
 		options = gateway.Config{
 			SecretsPath: "docker-desktop:/run/secrets/mcp_secret:/.env",
 			Options: gateway.Options{
-				Cpus:         1,
-				Memory:       "2Gb",
-				Transport:    "stdio",
-				LogCalls:     true,
-				BlockSecrets: true,
-				Verbose:      true,
+				Cpus:             1,
+				Memory:           "2Gb",
+				Transport:        "stdio",
+				LogCalls:         true,
+				BlockSecrets:     true,
+				Verbose:          true,
+				VerifySignatures: true,
 			},
 		}
 	} else {
@@ -49,12 +50,13 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli, features featur
 		options = gateway.Config{
 			SecretsPath: "docker-desktop",
 			Options: gateway.Options{
-				Cpus:         1,
-				Memory:       "2Gb",
-				Transport:    "stdio",
-				LogCalls:     true,
-				BlockSecrets: true,
-				Watch:        true,
+				Cpus:             1,
+				Memory:           "2Gb",
+				Transport:        "stdio",
+				LogCalls:         true,
+				BlockSecrets:     true,
+				Watch:            true,
+				VerifySignatures: true,
 			},
 		}
 	}
@@ -189,8 +191,8 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli, features featur
 		runCmd.Flags().StringVar(&options.WorkingSet, "profile", "", "Profile ID to use (mutually exclusive with --servers and --enable-all-servers)")
 	}
 	runCmd.Flags().BoolVar(&enableAllServers, "enable-all-servers", false, "Enable all servers in the catalog (instead of using individual --servers options)")
-	runCmd.Flags().StringSliceVar(&options.CatalogPath, "catalog", options.CatalogPath, "Paths to docker catalogs (absolute or relative to ~/.docker/mcp/catalogs/)")
-	runCmd.Flags().StringSliceVar(&additionalCatalogs, "additional-catalog", nil, "Additional catalog paths to append to the default catalogs")
+	runCmd.Flags().StringSliceVar(&options.CatalogPath, "catalog", options.CatalogPath, "Catalog paths must resolve under ~/.docker/mcp/catalogs/")
+	runCmd.Flags().StringSliceVar(&additionalCatalogs, "additional-catalog", nil, "Additional catalog paths must resolve under ~/.docker/mcp/catalogs/")
 	runCmd.Flags().StringSliceVar(&options.RegistryPath, "registry", options.RegistryPath, "Paths to the registry files (absolute or relative to ~/.docker/mcp/)")
 	runCmd.Flags().StringSliceVar(&additionalRegistries, "additional-registry", nil, "Additional registry paths to merge with the default registry.yaml")
 	runCmd.Flags().StringSliceVar(&options.ConfigPath, "config", options.ConfigPath, "Paths to the config files (absolute or relative to ~/.docker/mcp/)")
@@ -203,11 +205,13 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli, features featur
 	runCmd.Flags().StringArrayVar(&options.OciRef, "oci-ref", options.OciRef, "OCI image references to use")
 	runCmd.Flags().StringSliceVar(&mcpRegistryUrls, "mcp-registry", nil, "MCP registry URLs to fetch servers from (can be repeated)")
 	runCmd.Flags().IntVar(&options.Port, "port", options.Port, "TCP port to listen on (default is to listen on stdio)")
+	runCmd.Flags().StringVar(&options.Host, "host", options.Host, "Host or IP address to bind TCP transports to")
 	runCmd.Flags().StringVar(&options.Transport, "transport", options.Transport, "stdio, sse or streaming. Uses MCP_GATEWAY_AUTH_TOKEN environment variable for localhost authentication to prevent dns rebinding attacks.")
+	runCmd.Flags().BoolVar(&options.AllowUnauthenticated, "allow-unauthenticated", options.AllowUnauthenticated, "Allow unauthenticated HTTP/SSE gateway requests")
 	runCmd.Flags().BoolVar(&options.LogCalls, "log-calls", options.LogCalls, "Log calls to the tools")
 	runCmd.Flags().BoolVar(&options.BlockSecrets, "block-secrets", options.BlockSecrets, "Block secrets from being/received sent to/from tools")
 	runCmd.Flags().BoolVar(&options.BlockNetwork, "block-network", options.BlockNetwork, "Block tools from accessing forbidden network resources")
-	runCmd.Flags().BoolVar(&options.VerifySignatures, "verify-signatures", options.VerifySignatures, "Verify signatures of the server images")
+	runCmd.Flags().BoolVar(&options.VerifySignatures, "verify-signatures", options.VerifySignatures, "Verify signatures of Docker MCP server images")
 	runCmd.Flags().BoolVar(&options.DryRun, "dry-run", options.DryRun, "Start the gateway but do not listen for connections (useful for testing the configuration)")
 	runCmd.Flags().BoolVar(&options.Verbose, "verbose", options.Verbose, "Verbose output")
 	runCmd.Flags().BoolVar(&options.LongLived, "long-lived", options.LongLived, "Containers are long-lived and will not be removed until the gateway is stopped, useful for stateful servers")

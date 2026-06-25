@@ -13,15 +13,17 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/docker/mcp-gateway/pkg/catalog"
+	"github.com/docker/mcp-gateway/pkg/policy"
 	"github.com/docker/mcp-gateway/pkg/telemetry"
 )
 
-func getClientConfig(readOnlyHint *bool, ss *mcp.ServerSession, server *mcp.Server) *clientConfig {
-	return &clientConfig{readOnly: readOnlyHint, serverSession: ss, server: server}
+func getClientConfig(ss *mcp.ServerSession, server *mcp.Server) *clientConfig {
+	return &clientConfig{serverSession: ss, server: server}
 }
 
-// inferServerType determines the type of MCP server based on its configuration
-func inferServerType(serverConfig *catalog.ServerConfig) string {
+// inferServerTransportType determines a transport type label for telemetry.
+// It returns streaming, sse, docker, or unknown based on server configuration.
+func inferServerTransportType(serverConfig *catalog.ServerConfig) string {
 	if serverConfig.Spec.Remote.Transport == "http" {
 		return "streaming"
 	}
@@ -57,12 +59,30 @@ func (g *Gateway) mcpToolHandler(tool catalog.Tool) mcp.ToolHandler {
 	}
 }
 
-func (g *Gateway) mcpServerToolHandler(serverName string, server *mcp.Server, annotations *mcp.ToolAnnotations, originalToolName string) mcp.ToolHandler {
+func (g *Gateway) mcpServerToolHandler(serverName string, server *mcp.Server, _ *mcp.ToolAnnotations, originalToolName string) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		// Look up server configuration
 		serverConfig, _, ok := g.configuration.Find(serverName)
 		if !ok {
 			return nil, fmt.Errorf("server %q not found in configuration", serverName)
+		}
+
+		if g.policyClient != nil {
+			policyReq := g.configuration.policyRequest(
+				serverConfig.Name,
+				originalToolName,
+				policy.ActionInvoke,
+			)
+			decision, err := g.policyClient.Evaluate(ctx, policyReq)
+			event := buildAuditEvent(policyReq, decision, err, auditClientInfoFromSession(req.Session))
+			submitAuditEvent(g.policyClient, event)
+			if err != nil {
+				telemetry.RecordToolError(ctx, nil, serverConfig.Name, inferServerTransportType(serverConfig), req.Params.Name)
+				return nil, fmt.Errorf("policy check failed for %s/%s: %w", serverConfig.Name, originalToolName, err)
+			}
+			if !decision.Allowed {
+				return nil, fmt.Errorf("policy denied tool %s on server %s: %s", originalToolName, serverConfig.Name, decision.Reason)
+			}
 		}
 
 		// Debug logging to stderr
@@ -72,12 +92,12 @@ func (g *Gateway) mcpServerToolHandler(serverName string, server *mcp.Server, an
 
 		// Start telemetry span for tool call
 		startTime := time.Now()
-		serverType := inferServerType(serverConfig)
+		serverTransportType := inferServerTransportType(serverConfig)
 
 		// Build span attributes
 		spanAttrs := []attribute.KeyValue{
 			attribute.String("mcp.server.name", serverConfig.Name),
-			attribute.String("mcp.server.type", serverType),
+			attribute.String("mcp.server.type", serverTransportType),
 		}
 
 		// Add additional server-specific attributes
@@ -97,21 +117,16 @@ func (g *Gateway) mcpServerToolHandler(serverName string, server *mcp.Server, an
 		telemetry.ToolCallCounter.Add(ctx, 1,
 			metric.WithAttributes(
 				attribute.String("mcp.server.name", serverConfig.Name),
-				attribute.String("mcp.server.type", serverType),
+				attribute.String("mcp.server.type", serverTransportType),
 				attribute.String("mcp.tool.name", req.Params.Name),
 				attribute.String("mcp.client.name", req.Session.InitializeParams().ClientInfo.Name),
 			),
 		)
 
-		var readOnlyHint *bool
-		if annotations != nil && annotations.ReadOnlyHint {
-			readOnlyHint = &annotations.ReadOnlyHint
-		}
-
-		client, err := g.clientPool.AcquireClient(ctx, serverConfig, getClientConfig(readOnlyHint, req.Session, server))
+		client, err := g.clientPool.AcquireClient(ctx, serverConfig, getClientConfig(req.Session, server))
 		if err != nil {
 			// Record error in telemetry
-			telemetry.RecordToolError(ctx, span, serverConfig.Name, serverType, req.Params.Name)
+			telemetry.RecordToolError(ctx, span, serverConfig.Name, serverTransportType, req.Params.Name)
 			span.SetStatus(codes.Error, "Failed to acquire client")
 			return nil, err
 		}
@@ -121,7 +136,7 @@ func (g *Gateway) mcpServerToolHandler(serverName string, server *mcp.Server, an
 		var args any
 		if len(req.Params.Arguments) > 0 {
 			if jsonErr := json.Unmarshal(req.Params.Arguments, &args); jsonErr != nil {
-				telemetry.RecordToolError(ctx, span, serverConfig.Name, serverType, req.Params.Name)
+				telemetry.RecordToolError(ctx, span, serverConfig.Name, serverTransportType, req.Params.Name)
 				span.SetStatus(codes.Error, "Failed to unmarshal arguments")
 				return nil, fmt.Errorf("failed to unmarshal arguments: %w", jsonErr)
 			}
@@ -140,7 +155,7 @@ func (g *Gateway) mcpServerToolHandler(serverName string, server *mcp.Server, an
 		telemetry.ToolCallDuration.Record(ctx, float64(duration),
 			metric.WithAttributes(
 				attribute.String("mcp.server.name", serverConfig.Name),
-				attribute.String("mcp.server.type", serverType),
+				attribute.String("mcp.server.type", serverTransportType),
 				attribute.String("mcp.tool.name", req.Params.Name),
 				attribute.String("mcp.client.name", req.Session.InitializeParams().ClientInfo.Name),
 			),
@@ -148,7 +163,7 @@ func (g *Gateway) mcpServerToolHandler(serverName string, server *mcp.Server, an
 
 		if err != nil {
 			// Record error in telemetry
-			telemetry.RecordToolError(ctx, span, serverConfig.Name, serverType, req.Params.Name)
+			telemetry.RecordToolError(ctx, span, serverConfig.Name, serverTransportType, req.Params.Name)
 			span.SetStatus(codes.Error, "Tool execution failed")
 			return nil, err
 		}
@@ -166,6 +181,23 @@ func (g *Gateway) mcpServerPromptHandler(serverName string, server *mcp.Server) 
 			return nil, fmt.Errorf("server %q not found in configuration", serverName)
 		}
 
+		if g.policyClient != nil {
+			policyReq := g.configuration.policyRequest(
+				serverConfig.Name,
+				req.Params.Name,
+				policy.ActionPrompt,
+			)
+			decision, err := g.policyClient.Evaluate(ctx, policyReq)
+			event := buildAuditEvent(policyReq, decision, err, auditClientInfoFromSession(req.Session))
+			submitAuditEvent(g.policyClient, event)
+			if err != nil {
+				return nil, fmt.Errorf("policy check failed for prompt %s on server %s: %w", req.Params.Name, serverConfig.Name, err)
+			}
+			if !decision.Allowed {
+				return nil, fmt.Errorf("policy denied prompt %s on server %s: %s", req.Params.Name, serverConfig.Name, decision.Reason)
+			}
+		}
+
 		// Debug logging to stderr
 		if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
 			fmt.Fprintf(os.Stderr, "[MCP-HANDLER] Prompt get received: %s from server: %s\n", req.Params.Name, serverConfig.Name)
@@ -173,12 +205,12 @@ func (g *Gateway) mcpServerPromptHandler(serverName string, server *mcp.Server) 
 
 		// Start telemetry span for prompt operation
 		startTime := time.Now()
-		serverType := inferServerType(serverConfig)
+		serverTransportType := inferServerTransportType(serverConfig)
 
 		// Build span attributes
 		spanAttrs := []attribute.KeyValue{
 			attribute.String("mcp.server.name", serverConfig.Name),
-			attribute.String("mcp.server.type", serverType),
+			attribute.String("mcp.server.type", serverTransportType),
 		}
 
 		// Add additional server-specific attributes
@@ -197,7 +229,7 @@ func (g *Gateway) mcpServerPromptHandler(serverName string, server *mcp.Server) 
 		// Record prompt get counter
 		telemetry.RecordPromptGet(ctx, req.Params.Name, serverConfig.Name, req.Session.InitializeParams().ClientInfo.Name)
 
-		client, err := g.clientPool.AcquireClient(ctx, serverConfig, getClientConfig(nil, req.Session, server))
+		client, err := g.clientPool.AcquireClient(ctx, serverConfig, getClientConfig(req.Session, server))
 		if err != nil {
 			span.RecordError(err)
 			telemetry.RecordPromptError(ctx, req.Params.Name, serverConfig.Name, "acquire_failed")
@@ -239,12 +271,12 @@ func (g *Gateway) mcpServerResourceHandler(serverName string, server *mcp.Server
 
 		// Start telemetry span for resource operation
 		startTime := time.Now()
-		serverType := inferServerType(serverConfig)
+		serverTransportType := inferServerTransportType(serverConfig)
 
 		// Build span attributes - include server-specific attributes
 		spanAttrs := []attribute.KeyValue{
 			attribute.String("mcp.server.origin", serverConfig.Name),
-			attribute.String("mcp.server.type", serverType),
+			attribute.String("mcp.server.type", serverTransportType),
 		}
 
 		// Add additional server-specific attributes
@@ -264,7 +296,7 @@ func (g *Gateway) mcpServerResourceHandler(serverName string, server *mcp.Server
 		// Record counter with server attribution
 		telemetry.RecordResourceRead(ctx, req.Params.URI, serverConfig.Name, req.Session.InitializeParams().ClientInfo.Name)
 
-		client, err := g.clientPool.AcquireClient(ctx, serverConfig, getClientConfig(nil, req.Session, server))
+		client, err := g.clientPool.AcquireClient(ctx, serverConfig, getClientConfig(req.Session, server))
 		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "Failed to acquire client")

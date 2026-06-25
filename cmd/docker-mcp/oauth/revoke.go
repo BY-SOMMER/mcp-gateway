@@ -4,49 +4,75 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/docker/mcp-gateway/pkg/catalog"
+	"github.com/docker/mcp-gateway/cmd/docker-mcp/secret-management/secret"
+	"github.com/docker/mcp-gateway/pkg/db"
 	"github.com/docker/mcp-gateway/pkg/desktop"
 	pkgoauth "github.com/docker/mcp-gateway/pkg/oauth"
+	"github.com/docker/mcp-gateway/pkg/workingset"
 )
 
+// Function pointers for testability (same pattern as pkg/workingset/oauth.go).
+var (
+	revokeCEModeFunc        = revokeCEMode
+	revokeDesktopModeFunc   = revokeDesktopMode
+	revokeCommunityModeFunc = revokeCommunityMode
+
+	// Internal deps used by mode handlers — overridden in tests to avoid
+	// requiring docker pass, Docker Desktop, or a real database.
+	deleteOAuthTokenFunc      = secret.DeleteOAuthToken
+	deleteDCRClientFunc       = secret.DeleteDCRClient
+	desktopDeleteOAuthAppFunc = func(ctx context.Context, app string) error {
+		return desktop.NewAuthClient().DeleteOAuthApp(ctx, app)
+	}
+)
+
+// Revoke revokes OAuth access for a server, routing to the appropriate flow
+// based on the per-server mode (Desktop, CE, or Community).
 func Revoke(ctx context.Context, app string) error {
 	fmt.Printf("Revoking OAuth access for %s...\n", app)
 
-	// Check if CE mode
-	if pkgoauth.IsCEMode() {
-		return revokeCEMode(ctx, app)
+	isCommunity, err := lookupIsCommunityFunc(ctx, app)
+	if err != nil {
+		// Server not in catalog -- fall back to legacy global routing.
+		if isCEModeFunc() {
+			return revokeCEModeFunc(ctx, app)
+		}
+		return revokeDesktopModeFunc(ctx, app)
 	}
 
-	// Desktop mode - existing implementation
-	return revokeDesktopMode(ctx, app)
+	switch determineModeFunc(ctx, isCommunity) {
+	case pkgoauth.ModeCE:
+		return revokeCEModeFunc(ctx, app)
+	case pkgoauth.ModeCommunity:
+		return revokeCommunityModeFunc(ctx, app)
+	default: // ModeDesktop
+		return revokeDesktopModeFunc(ctx, app)
+	}
 }
 
-// revokeDesktopMode handles revoke via Docker Desktop (existing behavior)
+// revokeDesktopMode handles revoke via Docker Desktop (catalog servers).
 func revokeDesktopMode(ctx context.Context, app string) error {
-	client := desktop.NewAuthClient()
+	// Best-effort cleanup of docker pass entries that may exist from a
+	// previous community-mode authorization. Run this before the Desktop
+	// API call so entries are cleaned even when the Desktop provider has
+	// no token for this server.
+	cleanStaleDockerPassEntriesFunc(ctx, app)
 
-	// Get catalog to check if this is a remote OAuth server
-	catalogData, err := catalog.GetWithOptions(ctx, true, nil)
-	if err != nil {
-		return fmt.Errorf("failed to get catalog: %w", err)
-	}
-
-	server, found := catalogData.Servers[app]
-	isRemoteOAuth := found && server.IsRemoteOAuthServer()
-
-	// Revoke tokens
-	if err := client.DeleteOAuthApp(ctx, app); err != nil {
+	// Revoke tokens via Docker Desktop
+	if err := desktopDeleteOAuthAppFunc(ctx, app); err != nil {
 		return fmt.Errorf("failed to revoke OAuth access: %w", err)
 	}
 
-	// For remote OAuth servers, also delete DCR client
-	if isRemoteOAuth {
-		if err := client.DeleteDCRClient(ctx, app); err != nil {
-			return fmt.Errorf("failed to remove DCR client: %w", err)
-		}
+	fmt.Printf("OAuth access revoked for %s\n", app)
+
+	// Clean up DCR entry if the server is not in any profile.
+	// If the server is still in a profile, keep the DCR entry so it
+	// remains visible in the OAuth UI for re-authorization.
+	dao, err := db.New()
+	if err == nil {
+		workingset.CleanupOrphanedDCREntries(ctx, dao, []string{app}, nil)
 	}
 
-	fmt.Printf("OAuth access revoked for %s\n", app)
 	return nil
 }
 
@@ -66,6 +92,33 @@ func revokeCEMode(ctx context.Context, app string) error {
 	if err := manager.DeleteDCRClient(app); err != nil {
 		return fmt.Errorf("failed to delete DCR client: %w", err)
 	}
+
+	fmt.Printf("OAuth access revoked for %s\n", app)
+	return nil
+}
+
+// revokeCommunityMode handles revoke for community servers in Desktop mode.
+// Deletes the OAuth token and DCR client from docker pass, and cleans up
+// any stale Desktop Secrets Engine entries left from prior Desktop OAuth
+// authorizations.
+func revokeCommunityMode(ctx context.Context, app string) error {
+	// Delete OAuth token from docker pass
+	if err := deleteOAuthTokenFunc(ctx, app); err != nil {
+		// Token might not exist, continue to DCR deletion
+		fmt.Printf("Note: %v\n", err)
+	}
+
+	// Delete DCR client from docker pass (soft failure -- entry may not exist
+	// if authorize was never completed or was already revoked)
+	if err := deleteDCRClientFunc(ctx, app); err != nil {
+		fmt.Printf("Note: %v\n", err)
+	}
+
+	// Best-effort cleanup of stale Desktop Secrets Engine entries. Desktop
+	// may have stored oauth/dcr entries for this community server from a
+	// prior authorization. Removing them prevents the Secrets Engine from
+	// returning stale Desktop-managed tokens that shadow docker pass entries.
+	cleanStaleDesktopEntriesFunc(ctx, app)
 
 	fmt.Printf("OAuth access revoked for %s\n", app)
 	return nil

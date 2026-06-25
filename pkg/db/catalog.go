@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/docker/mcp-gateway/pkg/catalog"
 )
 
 type CatalogDAO interface {
@@ -37,6 +39,23 @@ type CatalogServer struct {
 	CatalogRef string   `db:"catalog_ref" json:"catalog_ref"`
 
 	Snapshot *ServerSnapshot `db:"snapshot" json:"snapshot"`
+}
+
+// FindServerInCatalogs searches all catalogs in the database for a server by name.
+// Returns the matching catalog.Server or an error if not found.
+func FindServerInCatalogs(ctx context.Context, dao DAO, serverName string) (catalog.Server, error) {
+	catalogs, err := dao.ListCatalogs(ctx)
+	if err != nil {
+		return catalog.Server{}, fmt.Errorf("listing catalogs: %w", err)
+	}
+	for _, cat := range catalogs {
+		for _, s := range cat.Servers {
+			if s.Snapshot != nil && s.Snapshot.Server.Name == serverName {
+				return s.Snapshot.Server, nil
+			}
+		}
+	}
+	return catalog.Server{}, fmt.Errorf("server %s not found in catalog", serverName)
 }
 
 func (tools ToolList) Value() (driver.Value, error) {
@@ -107,9 +126,19 @@ func (d *dao) UpsertCatalog(ctx context.Context, catalog Catalog) error {
 		server_type, tools, source, image, endpoint, catalog_ref, snapshot
 	) VALUES (:server_type, :tools, :source, :image, :endpoint, :catalog_ref, :snapshot)`
 
-		_, err = tx.NamedExecContext(ctx, serverQuery, catalog.Servers)
-		if err != nil {
-			return err
+		// Insert in batches. A slice passed to NamedExecContext expands into a
+		// single multi-row INSERT with one bound parameter per column per row,
+		// and SQLite caps the number of variables per statement at 32766
+		// (SQLITE_MAX_VARIABLE_NUMBER). With 7 columns per server, large
+		// catalogs (e.g. the community registry's thousands of servers) exceed
+		// that limit and fail with "too many SQL variables".
+		const columnsPerServer = 7
+		const batchSize = 32766 / columnsPerServer // 4680 servers per statement
+		for start := 0; start < len(catalog.Servers); start += batchSize {
+			end := min(start+batchSize, len(catalog.Servers))
+			if _, err = tx.NamedExecContext(ctx, serverQuery, catalog.Servers[start:end]); err != nil {
+				return err
+			}
 		}
 	}
 

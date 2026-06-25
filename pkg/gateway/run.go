@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/docker/mcp-gateway/pkg/log"
 	"github.com/docker/mcp-gateway/pkg/oauth"
 	"github.com/docker/mcp-gateway/pkg/oci"
+	"github.com/docker/mcp-gateway/pkg/policy"
 	"github.com/docker/mcp-gateway/pkg/telemetry"
 	"github.com/docker/mcp-gateway/pkg/user"
 )
@@ -60,6 +62,7 @@ type Gateway struct {
 	configuration  Configuration
 	clientPool     *clientPool
 	mcpServer      *mcp.Server
+	policyClient   policy.Client
 	health         health.State
 	oauthProviders map[string]*oauth.Provider
 	providersMu    sync.RWMutex
@@ -79,6 +82,9 @@ type Gateway struct {
 	// Track ongoing refresh operations per server to prevent concurrent/recursive refreshes
 	refreshMu         sync.Mutex
 	refreshingServers map[string]bool
+
+	// Protect configuration modifications during profile activation
+	configurationMu sync.Mutex
 
 	// embeddings client for vector search
 	embeddingsClient *embeddings.VectorDBClient
@@ -125,9 +131,19 @@ func NewGateway(config Config, docker docker.Client) *Gateway {
 	return g
 }
 
+func (g *Gateway) filterByPolicy(ctx context.Context, cfg *Configuration) {
+	if err := cfg.FilterByPolicy(ctx, g.policyClient); err != nil {
+		log.Log("policy filtering failed:", err)
+	}
+}
+
 func (g *Gateway) Run(ctx context.Context) error {
 	// Initialize telemetry
 	telemetry.Init()
+
+	if g.policyClient == nil {
+		g.policyClient = newPolicyClient(ctx)
+	}
 
 	// Set up log file redirection if specified
 	if g.LogFilePath != "" {
@@ -211,7 +227,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 			lc  net.ListenConfig
 			err error
 		)
-		ln, err = lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", port))
+		ln, err = lc.Listen(ctx, "tcp", gatewayListenAddress(g.Host, port))
 		if err != nil {
 			return err
 		}
@@ -219,10 +235,11 @@ func (g *Gateway) Run(ctx context.Context) error {
 
 	// Read the configuration.
 	configuration, configurationUpdates, stopConfigWatcher, err := g.configurator.Read(ctx)
-	g.configuration = configuration
 	if err != nil {
 		return err
 	}
+	g.filterByPolicy(ctx, &configuration)
+	g.configuration = configuration
 	defer func() { _ = stopConfigWatcher() }()
 
 	// Parse interceptors
@@ -276,6 +293,15 @@ func (g *Gateway) Run(ctx context.Context) error {
 					log.Log(fmt.Sprintf("- Initialize request:\n  %s", string(initJSON)))
 				}
 			}
+
+			// Release cached containers when the session disconnects
+			ss := req.Session
+			go func() {
+				_ = ss.Wait() // blocks until the session closes
+				log.Log(fmt.Sprintf("- Client disconnected %s@%s, releasing containers", clientInfo.Name, clientInfo.Version))
+				g.clientPool.ReleaseClientsForSession(ss)
+				g.RemoveSessionCache(ss)
+			}()
 		},
 		HasPrompts:   true,
 		HasResources: true,
@@ -315,7 +341,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 		return fmt.Errorf("loading configuration: %w", err)
 	}
 
-	// When running in Container mode, disable OAuth notification monitoring and authentication
+	// When running in Container mode, disable OAuth notification monitoring.
 	inContainer := os.Getenv("DOCKER_MCP_IN_CONTAINER") == "1"
 
 	if g.McpOAuthDcrEnabled && !inContainer {
@@ -336,16 +362,44 @@ func (g *Gateway) Run(ctx context.Context) error {
 			monitor.Start(ctx)
 		}
 
-		// Start OAuth provider for each OAuth server
-		// Each provider runs in its own goroutine with dynamic timing based on token expiry
+		// Start OAuth provider for each OAuth server.
+		// Each provider runs in its own goroutine with dynamic timing based on token expiry.
 		log.Log("- Starting OAuth provider loops...")
+
+		// Pre-flight check: verify docker pass availability once for all
+		// community servers that may need it. Avoids repeated shell-outs.
+		hasDockerPass := desktop.CheckHasDockerPass(ctx) == nil
+
 		for _, serverName := range configuration.ServerNames() {
 			serverConfig, _, found := configuration.Find(serverName)
-			if !found || serverConfig == nil || !serverConfig.Spec.IsRemoteOAuthServer() {
+			if !found || serverConfig == nil {
 				continue
 			}
 
-			g.startProvider(ctx, serverName)
+			isCommunity := serverConfig.Spec.IsCommunity()
+			mode := oauth.DetermineMode(ctx, isCommunity)
+
+			// Community mode requires docker pass. If unavailable, fall
+			// back to Desktop mode so the server is not left unmanaged.
+			if mode == oauth.ModeCommunity && !hasDockerPass {
+				log.Logf("! docker pass unavailable -- falling back to Desktop OAuth for community server %s", serverName)
+				mode = oauth.ModeDesktop
+			}
+
+			credHelper := oauth.NewOAuthCredentialHelperWithMode(mode)
+
+			if serverConfig.Spec.HasExplicitOAuthProviders() {
+				g.startProvider(ctx, serverName, mode)
+			} else if serverConfig.IsRemote() {
+				// Community/remote servers: start provider if they have a stored OAuth token
+				// from dynamic discovery (DCR without explicit OAuth metadata)
+				if exists, err := credHelper.TokenExists(ctx, serverName); err != nil {
+					log.Logf("Warning: Failed to check OAuth token for %s: %v", serverName, err)
+				} else if exists {
+					log.Logf("- Starting OAuth provider for remote server: %s (mode=%s)", serverName, mode)
+					g.startProvider(ctx, serverName, mode)
+				}
+			}
 		}
 	}
 
@@ -360,6 +414,8 @@ func (g *Gateway) Run(ctx context.Context) error {
 					return
 				case configuration := <-configurationUpdates:
 					log.Log("> Configuration updated, reloading...")
+
+					g.filterByPolicy(ctx, &configuration)
 
 					if err := g.pullAndVerify(ctx, configuration); err != nil {
 						log.Logf("> Unable to pull and verify images: %s", err)
@@ -382,16 +438,10 @@ func (g *Gateway) Run(ctx context.Context) error {
 		return nil
 	}
 
-	// Initialize authentication token for SSE and streaming modes
-	// Skip authentication when running in container (DOCKER_MCP_IN_CONTAINER=1)
+	// Initialize authentication token for SSE and streaming modes.
 	transport := strings.ToLower(g.Transport)
-	if (transport == "sse" || transport == "http" || transport == "streamable" || transport == "streaming" || transport == "streamable-http") && !inContainer {
-		token, wasGenerated, err := getOrGenerateAuthToken()
-		if err != nil {
-			return fmt.Errorf("failed to initialize auth token: %w", err)
-		}
-		g.authToken = token
-		g.authTokenWasGenerated = wasGenerated
+	if err := g.initializeHTTPAuth(); err != nil {
+		return err
 	}
 
 	// Start the server
@@ -404,9 +454,9 @@ func (g *Gateway) Run(ctx context.Context) error {
 		log.Log("> Start sse server on port", g.Port)
 		endpoint := "/sse"
 		url := formatGatewayURL(g.Port, endpoint)
-		if inContainer {
+		if g.AllowUnauthenticated {
 			log.Logf("> Gateway URL: %s", url)
-			log.Logf("> Authentication disabled (running in container)")
+			log.Logf("> Authentication disabled by explicit configuration")
 		} else if g.authTokenWasGenerated {
 			log.Logf("> Gateway URL: %s", url)
 			log.Logf("> Use Bearer token: %s", formatBearerToken(g.authToken))
@@ -420,9 +470,9 @@ func (g *Gateway) Run(ctx context.Context) error {
 		log.Log("> Start streaming server on port", g.Port)
 		endpoint := "/mcp"
 		url := formatGatewayURL(g.Port, endpoint)
-		if inContainer {
+		if g.AllowUnauthenticated {
 			log.Logf("> Gateway URL: %s", url)
-			log.Logf("> Authentication disabled (running in container)")
+			log.Logf("> Authentication disabled by explicit configuration")
 		} else if g.authTokenWasGenerated {
 			log.Logf("> Gateway URL: %s", url)
 			log.Logf("> Use Bearer token: %s", formatBearerToken(g.authToken))
@@ -435,6 +485,71 @@ func (g *Gateway) Run(ctx context.Context) error {
 	default:
 		return fmt.Errorf("unknown transport %q, expected 'stdio', 'sse' or 'streaming", g.Transport)
 	}
+}
+
+func (g *Gateway) initializeHTTPAuth() error {
+	if !isHTTPTransport(g.Transport) {
+		return nil
+	}
+	if g.AllowUnauthenticated {
+		if os.Getenv("MCP_GATEWAY_AUTH_TOKEN") != "" {
+			log.Log("Warning: ignoring MCP_GATEWAY_AUTH_TOKEN because --allow-unauthenticated is set")
+		}
+		if isExternallyReachableHost(g.Host) {
+			log.Logf("WARNING: --allow-unauthenticated is exposing the MCP gateway without authentication on %s. Any client that can reach this listener can execute configured MCP tools. Remove --allow-unauthenticated or bind with --host 127.0.0.1 unless this is intentional.", gatewayListenerDescription(g.Host))
+		}
+		return nil
+	}
+
+	token, wasGenerated, err := getOrGenerateAuthToken()
+	if err != nil {
+		return fmt.Errorf("failed to initialize auth token: %w", err)
+	}
+	if token == "" {
+		return fmt.Errorf("authentication token is empty")
+	}
+	g.authToken = token
+	g.authTokenWasGenerated = wasGenerated
+	return nil
+}
+
+func isHTTPTransport(transport string) bool {
+	switch strings.ToLower(transport) {
+	case "sse", "http", "streamable", "streaming", "streamable-http":
+		return true
+	default:
+		return false
+	}
+}
+
+func gatewayListenAddress(host string, port int) string {
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+func gatewayListenerDescription(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "all interfaces"
+	}
+	return host
+}
+
+func isExternallyReachableHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return true
+	}
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return true
+	}
+	return !ip.IsLoopback()
 }
 
 // RefreshCapabilities implements the CapabilityRefresher interface
@@ -581,8 +696,11 @@ func (g *Gateway) periodicMetricExport(ctx context.Context) {
 
 // OAuth Provider Management Methods
 
-// startProvider creates and starts an OAuth provider goroutine for a server
-func (g *Gateway) startProvider(ctx context.Context, serverName string) {
+// startProvider creates and starts an OAuth provider goroutine for a server.
+// The mode parameter controls which credential storage backend the provider
+// uses. Pass ModeAuto when the caller does not know the server type
+// (backward compat); the provider will fall back to runtime IsCEMode() detection.
+func (g *Gateway) startProvider(ctx context.Context, serverName string, mode oauth.Mode) {
 	g.providersMu.Lock()
 	defer g.providersMu.Unlock()
 
@@ -619,7 +737,7 @@ func (g *Gateway) startProvider(ctx context.Context, serverName string) {
 	}
 
 	// Create and start provider
-	provider := oauth.NewProvider(serverName, reloadFn)
+	provider := oauth.NewProvider(serverName, mode, reloadFn)
 	g.oauthProviders[serverName] = provider
 
 	// Wrapper goroutine handles cleanup after provider exits
@@ -649,15 +767,17 @@ func (g *Gateway) stopProvider(serverName string) {
 // routeEventToProvider routes SSE events to the appropriate provider
 func (g *Gateway) routeEventToProvider(event oauth.Event) {
 	g.providersMu.RLock()
-	provider, exists := g.oauthProviders[event.Provider]
+	_, exists := g.oauthProviders[event.Provider]
 	g.providersMu.RUnlock()
 
 	switch event.Type {
 	case oauth.EventLoginSuccess:
-		// User just authorized - ensure provider exists
+		// User just authorized via Desktop SSE - ensure provider exists.
+		// SSE events are only received in Desktop mode (the notification
+		// monitor is skipped in CE mode), so ModeDesktop is correct.
 		if !exists {
 			log.Logf("- Creating provider for %s after login", event.Provider)
-			g.startProvider(context.Background(), event.Provider)
+			g.startProvider(context.Background(), event.Provider, oauth.ModeDesktop)
 		}
 
 		// Always send event to trigger reload (connects server and lists tools)
@@ -667,7 +787,7 @@ func (g *Gateway) routeEventToProvider(event oauth.Event) {
 		}
 
 		g.providersMu.RLock()
-		provider, exists = g.oauthProviders[event.Provider]
+		provider, exists := g.oauthProviders[event.Provider]
 		g.providersMu.RUnlock()
 
 		if exists {
@@ -675,14 +795,16 @@ func (g *Gateway) routeEventToProvider(event oauth.Event) {
 		}
 
 	case oauth.EventTokenRefresh:
-		// Token refreshed - route to provider if exists
-		if exists {
-			provider.SendEvent(event)
-		}
-		// If doesn't exist, drop (another gateway or disabled server)
+		// Token refreshed - invalidate cached connections directly.
+		// Don't route to Provider (reloadFn would trigger Secrets Engine Filter → SSE loop).
+		// The Provider's timer handles refresh scheduling independently.
+		log.Logf("- OAuth token refreshed for %s, invalidating connections", event.Provider)
+		g.clientPool.InvalidateOAuthClients(event.Provider)
 
 	case oauth.EventLogoutSuccess:
-		// User logged out - stop provider if exists
+		// Invalidate cached OAuth client connections (clear stale bearer tokens)
+		g.clientPool.InvalidateOAuthClients(event.Provider)
+		// Stop provider if exists
 		if exists {
 			log.Logf("- Stopping provider for %s after logout", event.Provider)
 			g.stopProvider(event.Provider)

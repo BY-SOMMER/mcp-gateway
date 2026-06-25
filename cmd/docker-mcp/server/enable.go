@@ -15,6 +15,13 @@ import (
 	pkgoauth "github.com/docker/mcp-gateway/pkg/oauth"
 )
 
+// Function pointers for testability (same pattern as pkg/workingset/oauth.go).
+var (
+	shouldUseGatewayOAuthForEnableFunc    = pkgoauth.ShouldUseGatewayOAuth
+	registerProviderForLazySetupFunc      = pkgoauth.RegisterProviderForLazySetup
+	registerForDynamicDiscoveryEnableFunc = pkgoauth.RegisterProviderForDynamicDiscovery
+)
+
 func Disable(ctx context.Context, docker docker.Client, dockerCli command.Cli, serverNames []string, mcpOAuthDcrEnabled bool) error {
 	return update(ctx, docker, dockerCli, nil, serverNames, mcpOAuthDcrEnabled)
 }
@@ -61,24 +68,37 @@ func update(ctx context.Context, docker docker.Client, dockerCli command.Cli, ad
 			}
 
 			// DCR flag enabled AND type="remote" AND oauth present
-			if mcpOAuthDcrEnabled && server.IsRemoteOAuthServer() {
-				// In CE mode, skip lazy setup - DCR happens during oauth authorize
-				if pkgoauth.IsCEMode() {
+			if mcpOAuthDcrEnabled && server.HasExplicitOAuthProviders() {
+				isCommunity := server.IsCommunity()
+				if shouldUseGatewayOAuthForEnableFunc(ctx, isCommunity) {
+					// Gateway owns OAuth (CE mode or community + flag ON)
 					fmt.Printf("OAuth server %s enabled. Run 'docker mcp oauth authorize %s' to authenticate\n", serverName, serverName)
 				} else {
-					// Desktop mode - register provider for lazy setup
-					if err := pkgoauth.RegisterProviderForLazySetup(ctx, serverName); err != nil {
+					// Desktop mode — register provider for lazy setup
+					if err := registerProviderForLazySetupFunc(ctx, serverName); err != nil {
 						fmt.Printf("Warning: Failed to register OAuth provider for %s: %v\n", serverName, err)
 						fmt.Printf("   You can run 'docker mcp oauth authorize %s' later to set up authentication.\n", serverName)
 					} else {
 						fmt.Printf("OAuth provider configured for %s - use 'docker mcp oauth authorize %s' to authenticate\n", serverName, serverName)
 					}
 				}
-			} else if !mcpOAuthDcrEnabled && server.IsRemoteOAuthServer() {
+			} else if !mcpOAuthDcrEnabled && server.HasExplicitOAuthProviders() {
 				// Provide guidance when DCR is needed but disabled
 				fmt.Printf("Server %s requires OAuth authentication but DCR is disabled.\n", serverName)
 				fmt.Printf("   To enable automatic OAuth setup, run: docker mcp feature enable mcp-oauth-dcr\n")
 				fmt.Printf("   Or set up OAuth manually using: docker mcp oauth authorize %s\n", serverName)
+			} else if mcpOAuthDcrEnabled && server.Type == "remote" && !server.IsOAuthServer() && server.Remote.URL != "" {
+				// Remote server without oauth.providers — dynamic OAuth discovery.
+				// Always register with Desktop for OAuth tab visibility, even when
+				// Gateway owns the OAuth lifecycle (community + flag ON). The
+				// authorize/revoke flow is handled by Gateway via IPC delegation.
+				if err := registerForDynamicDiscoveryEnableFunc(ctx, serverName, server.Remote.URL); err != nil {
+					fmt.Printf("Warning: Dynamic OAuth discovery failed for %s: %v\n", serverName, err)
+				}
+				isCommunity := server.IsCommunity()
+				if shouldUseGatewayOAuthForEnableFunc(ctx, isCommunity) {
+					fmt.Printf("Remote server %s enabled. OAuth handled by Gateway — use 'docker mcp oauth authorize %s' or authorize from Docker Desktop\n", serverName, serverName)
+				}
 			}
 		} else {
 			return fmt.Errorf("server %s not found in catalog", serverName)

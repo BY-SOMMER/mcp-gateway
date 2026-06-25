@@ -10,8 +10,12 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/docker/mcp-gateway/cmd/docker-mcp/secret-management/secret"
 	"github.com/docker/mcp-gateway/pkg/catalog"
+	"github.com/docker/mcp-gateway/pkg/desktop"
+	"github.com/docker/mcp-gateway/pkg/log"
 	"github.com/docker/mcp-gateway/pkg/oauth"
+	"github.com/docker/mcp-gateway/pkg/remoteurl"
 )
 
 type remoteMCPClient struct {
@@ -28,7 +32,7 @@ func NewRemoteMCPClient(config *catalog.ServerConfig) Client {
 	}
 }
 
-func (c *remoteMCPClient) Initialize(ctx context.Context, _ *mcp.InitializeParams, _ bool, _ *mcp.ServerSession, _ *mcp.Server, _ CapabilityRefresher) error {
+func (c *remoteMCPClient) Initialize(ctx context.Context, _ *mcp.InitializeParams, verbose bool, _ *mcp.ServerSession, _ *mcp.Server, _ CapabilityRefresher) error {
 	if c.initialized.Load() {
 		return fmt.Errorf("client already initialized")
 	}
@@ -46,11 +50,33 @@ func (c *remoteMCPClient) Initialize(ctx context.Context, _ *mcp.InitializeParam
 		url = c.config.Spec.Remote.URL
 		transport = c.config.Spec.Remote.Transport
 	}
+	if err := remoteurl.Validate(ctx, url); err != nil {
+		return fmt.Errorf("unsafe remote MCP URL for %s: %w", c.config.Name, err)
+	}
 
 	// Secrets to env
 	env := map[string]string{}
-	for _, secret := range c.config.Spec.Secrets {
-		env[secret.Env] = c.config.Secrets[secret.Name]
+	for _, s := range c.config.Spec.Secrets {
+		// Remote servers need actual secret values for HTTP headers.
+		// se:// URIs only work for containers (Docker Desktop resolves them at runtime).
+		//
+		// Check if we have an actual value (from --secrets=file.env).
+		// If the value is an se:// URI or missing, query Secrets Engine API directly.
+		if value, ok := c.config.Secrets[s.Name]; ok && value != "" && !strings.HasPrefix(value, "se://") {
+			if verbose {
+				log.Logf("    - %s: %s", s.Env, maskSecret(value))
+			}
+			env[s.Env] = value
+		} else {
+			// Fall back to secrets engine (Docker Desktop direct API)
+			if verbose {
+				log.Logf("    - Fetching secret: %s", secret.GetDefaultSecretKey(s.Name))
+			}
+			env[s.Env] = getSecretValue(ctx, s.Name)
+			if verbose {
+				log.Logf("    - Got secret for: %s (len=%d)", s.Name, len(env[s.Env]))
+			}
+		}
 	}
 
 	// Headers
@@ -61,8 +87,27 @@ func (c *remoteMCPClient) Initialize(ctx context.Context, _ *mcp.InitializeParam
 
 	// Add OAuth token if remote server has OAuth configuration
 	if c.config.Spec.OAuth != nil && len(c.config.Spec.OAuth.Providers) > 0 {
-		token := c.getOAuthToken(ctx)
-		if token != "" {
+		if verbose {
+			log.Logf("    - Using OAuth token for: %s", c.config.Name)
+		}
+		credHelper := oauth.NewOAuthCredentialHelper()
+		token, err := credHelper.GetOAuthToken(ctx, c.config.Name)
+		if err != nil {
+			log.Logf("Failed to get OAuth token for %s: %v", c.config.Name, err)
+		} else if token != "" {
+			headers["Authorization"] = "Bearer " + token
+		}
+	} else if c.config.Spec.Remote.URL != "" {
+		// Community servers may have OAuth tokens via dynamic discovery (DCR)
+		// without explicit OAuth metadata in the catalog. Try to get a stored token.
+		// Use per-server mode so community servers read from docker pass.
+		mode := oauth.DetermineMode(ctx, c.config.Spec.IsCommunity())
+		credHelper := oauth.NewOAuthCredentialHelperWithMode(mode)
+		token, err := credHelper.GetOAuthToken(ctx, c.config.Name)
+		if err == nil && token != "" {
+			if verbose {
+				log.Logf("    - Using dynamic OAuth token for: %s", c.config.Name)
+			}
 			headers["Authorization"] = "Bearer " + token
 		}
 	}
@@ -70,10 +115,15 @@ func (c *remoteMCPClient) Initialize(ctx context.Context, _ *mcp.InitializeParam
 	var mcpTransport mcp.Transport
 	var err error
 
+	baseTransport := remoteurl.GuardDirectTransport()
+	if proxyDialer := desktop.DockerDesktopProxySocketDialer(ctx); proxyDialer != nil {
+		baseTransport = remoteurl.GuardTrustedProxyDialer(proxyDialer)
+	}
+
 	// Create HTTP client with custom headers
 	httpClient := &http.Client{
 		Transport: &headerRoundTripper{
-			base:    http.DefaultTransport,
+			base:    baseTransport,
 			headers: headers,
 		},
 	}
@@ -100,9 +150,17 @@ func (c *remoteMCPClient) Initialize(ctx context.Context, _ *mcp.InitializeParam
 
 	c.client.AddRoots(c.roots...)
 
+	if verbose {
+		log.Logf("    - Connecting to remote server: %s (transport=%s)", url, transport)
+	}
+
 	session, err := c.client.Connect(ctx, mcpTransport, nil)
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
+	}
+
+	if verbose {
+		log.Logf("    - Connected successfully to: %s", c.config.Name)
 	}
 
 	c.session = session
@@ -121,10 +179,35 @@ func (c *remoteMCPClient) AddRoots(roots []*mcp.Root) {
 	c.roots = roots
 }
 
+func getSecretValue(ctx context.Context, secretName string) string {
+	if err := secret.ValidateSecretName(secretName); err != nil {
+		log.Logf("Warning: skipping secret with invalid name %q: %v", secretName, err)
+		return ""
+	}
+	fullID := secret.GetDefaultSecretKey(secretName)
+	env, err := secret.GetSecret(ctx, fullID)
+	if err != nil {
+		return ""
+	}
+	return string(env.Value)
+}
+
 func expandEnv(value string, secrets map[string]string) string {
 	return os.Expand(value, func(name string) string {
 		return secrets[name]
 	})
+}
+
+// maskSecret shows the first few characters of a secret followed by asterisks.
+// se:// URIs are shown in full since they're just references, not actual secrets.
+func maskSecret(value string) string {
+	if strings.HasPrefix(value, "se://") {
+		return value
+	}
+	if len(value) <= 4 {
+		return "****"
+	}
+	return value[:4] + "****"
 }
 
 // headerRoundTripper is an http.RoundTripper that adds custom headers to all requests
@@ -145,21 +228,4 @@ func (h *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 		newReq.Header.Set(key, value)
 	}
 	return h.base.RoundTrip(newReq)
-}
-
-func (c *remoteMCPClient) getOAuthToken(ctx context.Context) string {
-	if c.config.Spec.OAuth == nil || len(c.config.Spec.OAuth.Providers) == 0 {
-		return ""
-	}
-
-	// Use secure credential helper to get OAuth token directly from system credential store
-	// This bypasses the vulnerable IPC endpoint that exposes tokens
-	credHelper := oauth.NewOAuthCredentialHelper()
-	token, err := credHelper.GetOAuthToken(ctx, c.config.Name)
-	if err != nil {
-		// Token might not exist if user hasn't authorized yet
-		return ""
-	}
-
-	return token
 }

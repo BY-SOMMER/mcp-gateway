@@ -8,10 +8,9 @@ import (
 
 	"github.com/docker/docker-credential-helpers/credentials"
 
-	oauth "github.com/docker/mcp-gateway-oauth-helpers"
-
-	"github.com/docker/mcp-gateway/pkg/catalog"
+	"github.com/docker/mcp-gateway/pkg/db"
 	"github.com/docker/mcp-gateway/pkg/log"
+	"github.com/docker/mcp-gateway/pkg/oauthdiscovery"
 )
 
 // Manager orchestrates Dynamic Client Registration flows
@@ -41,20 +40,37 @@ func (m *Manager) GetDCRClient(serverName string) (Client, error) {
 // PerformDiscoveryAndRegistration executes OAuth discovery and DCR for a server
 // This is called when no DCR client exists or when it needs re-registration
 func (m *Manager) PerformDiscoveryAndRegistration(ctx context.Context, serverName string, scopes string) error {
+	dcrClient, err := DiscoverAndRegister(ctx, serverName, scopes, m.redirectURI)
+	if err != nil {
+		return err
+	}
+
+	if err := m.credentials.SaveClient(serverName, dcrClient); err != nil {
+		return fmt.Errorf("saving DCR client for %s: %w", serverName, err)
+	}
+
+	log.Logf("- Completed DCR for: %s", serverName)
+	return nil
+}
+
+// DiscoverAndRegister performs OAuth discovery and DCR for a server, returning
+// the resulting Client without persisting it. Callers are responsible for
+// storing the client in the appropriate backend (credential helper, docker pass,
+// etc.). This is the storage-agnostic core of PerformDiscoveryAndRegistration.
+func DiscoverAndRegister(ctx context.Context, serverName string, scopes string, redirectURI string) (Client, error) {
 	log.Logf("- Performing OAuth discovery and DCR for: %s", serverName)
 
 	// Get server URL from catalog
 	serverURL, err := getServerURL(ctx, serverName)
 	if err != nil {
-		return fmt.Errorf("getting server URL: %w", err)
+		return Client{}, fmt.Errorf("getting server URL: %w", err)
 	}
 
 	// Perform OAuth discovery (RFC 9728, RFC 8414)
 	log.Logf("- Starting OAuth discovery for: %s at: %s", serverName, serverURL)
-	ctx = oauth.WithLogger(ctx, &logger{})
-	discovery, err := oauth.DiscoverOAuthRequirements(ctx, serverURL)
+	discovery, err := oauthdiscovery.DiscoverOAuthRequirements(ctx, serverURL)
 	if err != nil {
-		return fmt.Errorf("discovering OAuth requirements for %s: %w", serverName, err)
+		return Client{}, fmt.Errorf("discovering OAuth requirements for %s: %w", serverName, err)
 	}
 	log.Logf("- Discovery successful for: %s", serverName)
 
@@ -66,14 +82,13 @@ func (m *Manager) PerformDiscoveryAndRegistration(ctx context.Context, serverNam
 	}
 
 	// Perform Dynamic Client Registration (RFC 7591) with our redirect URI
-	creds, err := oauth.PerformDCR(ctx, discovery, serverName, m.redirectURI)
+	creds, err := oauthdiscovery.PerformDCR(ctx, discovery, serverName, redirectURI)
 	if err != nil {
-		return fmt.Errorf("registering DCR client for %s: %w", serverName, err)
+		return Client{}, fmt.Errorf("registering DCR client for %s: %w", serverName, err)
 	}
 	log.Logf("- Registration successful for: %s, clientID: %s", serverName, creds.ClientID)
 
-	// Create and save DCR client
-	dcrClient := Client{
+	return Client{
 		ServerName:            serverName,
 		ProviderName:          serverName, // For DCR, provider name = server name
 		ClientID:              creds.ClientID,
@@ -81,17 +96,11 @@ func (m *Manager) PerformDiscoveryAndRegistration(ctx context.Context, serverNam
 		AuthorizationEndpoint: creds.AuthorizationEndpoint,
 		TokenEndpoint:         creds.TokenEndpoint,
 		ResourceURL:           creds.ServerURL,
+		RedirectURI:           redirectURI,
 		ScopesSupported:       discovery.ScopesSupported,
 		RequiredScopes:        discovery.Scopes,
 		RegisteredAt:          time.Now(),
-	}
-
-	if err := m.credentials.SaveClient(serverName, dcrClient); err != nil {
-		return fmt.Errorf("saving DCR client for %s: %w", serverName, err)
-	}
-
-	log.Logf("- Completed DCR for: %s", serverName)
-	return nil
+	}, nil
 }
 
 // DeleteDCRClient removes a DCR client from storage
@@ -104,22 +113,19 @@ func (m *Manager) ListDCRClients() (map[string]Client, error) {
 	return m.credentials.ListClients()
 }
 
-// getServerURL retrieves the server URL from the catalog
+// getServerURL retrieves the server URL from the OCI catalog database.
 func getServerURL(ctx context.Context, serverName string) (string, error) {
-	cat, err := catalog.GetWithOptions(ctx, true, nil)
+	dao, err := db.New()
 	if err != nil {
-		return "", fmt.Errorf("failed to get catalog: %w", err)
+		return "", fmt.Errorf("opening database: %w", err)
 	}
-
-	server, found := cat.Servers[serverName]
-	if !found {
-		return "", fmt.Errorf("server %s not found in catalog", serverName)
+	server, err := db.FindServerInCatalogs(ctx, dao, serverName)
+	if err != nil {
+		return "", err
 	}
-
 	if server.Remote.URL == "" {
 		return "", fmt.Errorf("server %s is not a remote server or missing URL", serverName)
 	}
-
 	return server.Remote.URL, nil
 }
 
@@ -148,19 +154,4 @@ func mergeScopes(requiredScopes []string, userScopes string) []string {
 	}
 
 	return merged
-}
-
-// logger adapter for oauth-helpers library
-type logger struct{}
-
-func (l *logger) Infof(format string, args ...any) {
-	log.Logf(format, args...)
-}
-
-func (l *logger) Warnf(format string, args ...any) {
-	log.Logf("! "+format, args...)
-}
-
-func (l *logger) Debugf(format string, args ...any) {
-	log.Logf(format, args...)
 }

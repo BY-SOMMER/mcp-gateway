@@ -33,12 +33,40 @@ func getMockOciService() oci.Service {
 }
 
 func getMockRegistryClient() registryapi.Client {
-	server := v0.ServerResponse{
+	server1 := v0.ServerResponse{
 		Server: v0.ServerJSON{
-			Version: "0.1.0",
+			Name:        "io.example/server1",
+			Description: "Test server 1",
+			Version:     "0.1.0",
 			Packages: []model.Package{
 				{
 					RegistryType: "oci",
+					Identifier:   "ghcr.io/example/server1:0.1.0",
+					Transport: model.Transport{
+						Type: "stdio",
+					},
+				},
+			},
+		},
+		Meta: v0.ResponseMeta{
+			Official: &v0.RegistryExtensions{
+				IsLatest: true,
+			},
+		},
+	}
+
+	server2 := v0.ServerResponse{
+		Server: v0.ServerJSON{
+			Name:        "io.example/server2",
+			Description: "Test server 2",
+			Version:     "0.1.0",
+			Packages: []model.Package{
+				{
+					RegistryType: "oci",
+					Identifier:   "ghcr.io/example/server2:0.1.0",
+					Transport: model.Transport{
+						Type: "stdio",
+					},
 				},
 			},
 		},
@@ -51,14 +79,14 @@ func getMockRegistryClient() registryapi.Client {
 
 	return mocks.NewMockRegistryAPIClient(mocks.WithServerListResponses(map[string]v0.ServerListResponse{
 		"https://example.com/v0/servers/server1/versions": {
-			Servers: []v0.ServerResponse{server},
+			Servers: []v0.ServerResponse{server1},
 		},
 		"https://example.com/v0/servers/server2/versions": {
-			Servers: []v0.ServerResponse{server},
+			Servers: []v0.ServerResponse{server2},
 		},
 	}), mocks.WithServerResponses(map[string]v0.ServerResponse{
-		"https://example.com/v0/servers/server1/versions/0.1.0": server,
-		"https://example.com/v0/servers/server2/versions/0.1.0": server,
+		"https://example.com/v0/servers/server1/versions/0.1.0": server1,
+		"https://example.com/v0/servers/server2/versions/0.1.0": server2,
 	}))
 }
 
@@ -73,11 +101,11 @@ func TestCreateWithDockerImages(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify the working set was created
-	dbSet, err := dao.GetWorkingSet(ctx, "my-test-set")
+	dbSet, err := dao.GetWorkingSet(ctx, "my_test_set")
 	require.NoError(t, err)
 	require.NotNil(t, dbSet)
 
-	assert.Equal(t, "my-test-set", dbSet.ID)
+	assert.Equal(t, "my_test_set", dbSet.ID)
 	assert.Equal(t, "My Test Set", dbSet.Name)
 	assert.Len(t, dbSet.Servers, 2)
 
@@ -99,7 +127,7 @@ func TestCreateWithRegistryServers(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify the working set was created
-	dbSet, err := dao.GetWorkingSet(ctx, "registry-set")
+	dbSet, err := dao.GetWorkingSet(ctx, "registry_set")
 	require.NoError(t, err)
 	require.NotNil(t, dbSet)
 
@@ -123,7 +151,7 @@ func TestCreateWithMixedServers(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify the working set was created
-	dbSet, err := dao.GetWorkingSet(ctx, "mixed-set")
+	dbSet, err := dao.GetWorkingSet(ctx, "mixed_set")
 	require.NoError(t, err)
 	require.NotNil(t, dbSet)
 
@@ -168,7 +196,7 @@ func TestCreateWithExistingId(t *testing.T) {
 	assert.Contains(t, err.Error(), "already exists")
 }
 
-func TestCreateGeneratesUniqueIds(t *testing.T) {
+func TestCreateErrorsOnDuplicateDerivedID(t *testing.T) {
 	dao := setupTestDB(t)
 	ctx := t.Context()
 
@@ -178,34 +206,12 @@ func TestCreateGeneratesUniqueIds(t *testing.T) {
 	}, []string{})
 	require.NoError(t, err)
 
-	// Create second with same name
+	// Create second with same name should fail
 	err = Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "", "Test Set", []string{
 		"docker://anotherimage:v1.0",
 	}, []string{})
-	require.NoError(t, err)
-
-	// Create third with same name
-	err = Create(ctx, dao, getMockRegistryClient(), getMockOciService(), "", "Test Set", []string{
-		"docker://anotherimage:v1.0",
-	}, []string{})
-	require.NoError(t, err)
-
-	// List all working sets
-	sets, err := dao.ListWorkingSets(ctx)
-	require.NoError(t, err)
-	assert.Len(t, sets, 3)
-
-	// Verify IDs are unique
-	ids := make(map[string]bool)
-	for _, set := range sets {
-		assert.False(t, ids[set.ID], "ID %s should be unique", set.ID)
-		ids[set.ID] = true
-	}
-
-	// Verify ID pattern
-	assert.Contains(t, ids, "test-set")
-	assert.Contains(t, ids, "test-set-2")
-	assert.Contains(t, ids, "test-set-3")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already exists")
 }
 
 func TestCreateWithInvalidServerFormat(t *testing.T) {
@@ -238,7 +244,7 @@ func TestCreateWithEmptyServers(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify the working set was created with no servers
-	dbSet, err := dao.GetWorkingSet(ctx, "empty-set")
+	dbSet, err := dao.GetWorkingSet(ctx, "empty_set")
 	require.NoError(t, err)
 	require.NotNil(t, dbSet)
 
@@ -255,7 +261,7 @@ func TestCreateAddsDefaultSecrets(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify default secrets were added
-	dbSet, err := dao.GetWorkingSet(ctx, "test-set")
+	dbSet, err := dao.GetWorkingSet(ctx, "test_set")
 	require.NoError(t, err)
 	require.NotNil(t, dbSet)
 
@@ -273,22 +279,22 @@ func TestCreateNameWithSpecialCharacters(t *testing.T) {
 		{
 			name:       "name with spaces",
 			inputName:  "My Test Set",
-			expectedID: "my-test-set",
+			expectedID: "my_test_set",
 		},
 		{
 			name:       "name with special chars",
 			inputName:  "Test@Set#123!",
-			expectedID: "test-set-123-",
+			expectedID: "test_set_123_",
 		},
 		{
 			name:       "name with multiple spaces",
 			inputName:  "Test   Set",
-			expectedID: "test-set",
+			expectedID: "test_set",
 		},
 		{
 			name:       "name with underscores",
 			inputName:  "Test_Set_Name",
-			expectedID: "test-set-name",
+			expectedID: "test_set_name",
 		},
 	}
 
